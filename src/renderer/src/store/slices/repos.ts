@@ -9,6 +9,7 @@ import type { Repo } from '../../../../shared/types'
 import { isGitRepoKind } from '../../../../shared/repo-kind'
 import { getRepoIdFromWorktreeId } from './worktree-helpers'
 import { callRuntimeRpc, getActiveRuntimeTarget } from '../../runtime/runtime-rpc-client'
+import { buildDismissedOnboardingFolderAgentStartup } from '@/lib/onboarding-folder-agent-startup'
 
 const ERROR_TOAST_DURATION = 60_000
 
@@ -154,6 +155,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
 
   addNonGitFolder: async (path) => {
     try {
+      const hadProjectBeforeAdd = get().repos.length > 0
       const repo = await get().addRepoPath(path, 'folder')
       if (!repo) {
         return null
@@ -168,7 +170,16 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
       const folderWorktree = get().worktreesByRepo[repo.id]?.[0]
       if (folderWorktree) {
         const { activateAndRevealWorktree } = await import('../../lib/worktree-activation')
-        activateAndRevealWorktree(folderWorktree.id)
+        const onboarding = await window.api.onboarding.get().catch(() => null)
+        // Why: a new user can dismiss the wizard, then immediately add their
+        // first folder from Landing. That path skips onboarding's completeRepo
+        // hook, so carry the selected default agent into the first terminal here.
+        const startup = buildDismissedOnboardingFolderAgentStartup(
+          get().settings,
+          onboarding,
+          hadProjectBeforeAdd
+        )
+        activateAndRevealWorktree(folderWorktree.id, startup ? { startup } : undefined)
       }
       return repo
     } catch (err) {
