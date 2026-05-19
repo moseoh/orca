@@ -556,6 +556,14 @@ export function useIpcEvents(): void {
       })
     )
 
+    if (window.api.gh?.onPRRefreshEvent) {
+      unsubs.push(
+        window.api.gh.onPRRefreshEvent((event) => {
+          useAppStore.getState().applyGitHubPRRefreshEvent(event)
+        })
+      )
+    }
+
     unsubs.push(
       window.api.ui.onOpenSettings(() => {
         useAppStore.getState().openSettingsPage()
@@ -1655,11 +1663,6 @@ export function useIpcEvents(): void {
         }
 
         if (state.status === 'connected') {
-          // Why: the file explorer may have tried (and failed) to load the tree
-          // before the SSH connection was established. Bumping the generation
-          // lets it detect that providers are now available and retry.
-          store.bumpSshConnectedGeneration()
-
           void Promise.all(remoteRepos.map((r) => store.fetchWorktrees(r.id))).then(async () => {
             await useAppStore.getState().fetchWorktreeLineage()
             // Why: terminal panes that failed to spawn (no PTY provider on cold

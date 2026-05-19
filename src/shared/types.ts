@@ -608,6 +608,88 @@ export type PRInfo = {
   conflictSummary?: PRConflictSummary
 }
 
+export type PRRefreshOutcome =
+  | { kind: 'found'; pr: PRInfo; fetchedAt: number }
+  | { kind: 'no-pr'; fetchedAt: number }
+  | {
+      kind: 'upstream-error'
+      errorType:
+        | 'rate_limited'
+        | 'auth'
+        | 'network'
+        | 'permission'
+        | 'repo_unavailable'
+        | 'gh_unavailable'
+        | 'unknown'
+      message: string
+      fetchedAt: number
+    }
+
+export type GitHubPRRefreshReason = 'visible' | 'active' | 'post-push' | 'manual' | 'swr'
+
+export type GitHubPRRefreshAlias = {
+  cacheKey: string
+  repoId?: string
+  repoPath: string
+  branch: string
+  worktreeId?: string
+}
+
+export type GitHubPRRefreshCandidate = GitHubPRRefreshAlias & {
+  linkedPRNumber?: number | null
+  repoKind: RepoKind
+  repoId: string
+  isBare?: boolean
+  isArchived?: boolean
+  connectionId?: string | null
+  connectionState?: 'connected' | 'disconnected' | 'unknown'
+  cachedFetchedAt?: number | null
+  cachedHasPR?: boolean | null
+  cachedPRState?: PRState | null
+  cachedChecksStatus?: CheckStatus | null
+}
+
+export type GitHubPRRefreshSkippedReason =
+  | 'fresh'
+  | 'not-git'
+  | 'bare'
+  | 'archived'
+  | 'disconnected'
+  | 'remote'
+  | 'rate-limit'
+
+type GitHubPRRefreshEventBase = {
+  sequence: number
+  reason: GitHubPRRefreshReason
+  aliases: GitHubPRRefreshAlias[]
+}
+
+export type GitHubPRRefreshEvent =
+  | (GitHubPRRefreshEventBase & {
+      outcome: PRRefreshOutcome
+      status?: never
+      pausedUntil?: never
+      skippedReason?: never
+    })
+  | (GitHubPRRefreshEventBase & {
+      status: 'queued' | 'in-flight'
+      outcome?: never
+      pausedUntil?: never
+      skippedReason?: never
+    })
+  | (GitHubPRRefreshEventBase & {
+      status: 'paused'
+      pausedUntil: number
+      skippedReason: 'rate-limit'
+      outcome?: never
+    })
+  | (GitHubPRRefreshEventBase & {
+      status: 'skipped'
+      skippedReason: GitHubPRRefreshSkippedReason
+      outcome?: never
+      pausedUntil?: never
+    })
+
 export type PRCheckDetail = {
   name: string
   status: 'queued' | 'in_progress' | 'completed'
