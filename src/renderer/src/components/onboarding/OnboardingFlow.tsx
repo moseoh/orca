@@ -185,6 +185,7 @@ export default function OnboardingFlow({
       />
 
       <section
+        ref={flow.setLifecycleRootRef}
         role="dialog"
         aria-label="Orca onboarding"
         aria-modal="true"

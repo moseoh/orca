@@ -359,16 +359,6 @@ export function useOnboardingFlow(
     applyDocumentTheme(theme)
   }, [theme])
 
-  // Why: the theme step previews on the document before persistence. Revert to
-  // the persisted theme only on wizard unmount so saving (which updates
-  // settings.theme) doesn't trigger a one-frame revert/reapply flicker.
-  useEffect(() => {
-    return () => {
-      applyDocumentTheme(persistedThemeRef.current)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
   useEffect(() => {
     void refreshPreflightStatus()
   }, [refreshPreflightStatus])
@@ -476,11 +466,18 @@ export function useOnboardingFlow(
     recordOnboardingTourDepthSummary(tourOutcomeTrackerRef.current, summary)
   }, [])
 
-  useEffect(() => {
-    return () => {
+  const setLifecycleRootRef = useCallback(
+    (node: HTMLElement | null): void => {
+      if (node !== null) {
+        return
+      }
+      // Why: onboarding previews theme/tour state outside this component; tie
+      // final cleanup to the modal root detaching instead of passive Effects.
+      applyDocumentTheme(persistedThemeRef.current)
       emitPendingTourOutcome()
-    }
-  }, [emitPendingTourOutcome])
+    },
+    [emitPendingTourOutcome]
+  )
 
   const trackTaskSourcesSnapshot = useCallback(
     (
@@ -1395,6 +1392,7 @@ export function useOnboardingFlow(
     recordTourDepthSummary,
     back,
     jumpToStep,
+    setLifecycleRootRef,
     openFolder,
     continueWithExistingProject,
     openSshSettings,
