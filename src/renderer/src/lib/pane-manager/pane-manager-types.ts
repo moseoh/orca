@@ -26,7 +26,6 @@ export type PaneSpawnHints = {
 export type ClosedPaneInfo = {
   paneId: number
   leafId: TerminalLeafId
-  terminal?: Terminal
 }
 
 export type PaneManagerOptions = {
@@ -120,6 +119,8 @@ export type ManagedPaneInternal = {
   paneDragCleanup?: (() => void) | null
   // Stored so disposePane() can remove it and avoid a memory leak.
   compositionHandler: (() => void) | null
+  // Stored so disposePane() can remove DOM-renderer focus synchronization.
+  focusClassSyncCleanup?: (() => void) | null
   // Why: splitPane reparents DOM; its delayed restore owns scroll until the
   // browser settles, so intermediate fits must not compete with it.
   pendingSplitScrollState: ScrollState | null

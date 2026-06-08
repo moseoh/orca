@@ -1826,9 +1826,9 @@ export function connectPanePty(
       // Why: drain any queued background bytes BEFORE the replay paint, so the
       // scheduler's deferred drain cannot land older bytes on top of the replay.
       flushTerminalOutput(pane.terminal)
-      if (terminalOutputChunkPrefersDomRenderer(data)) {
-        manager.markPaneHasComplexScriptOutput(pane.id)
-      }
+      // Why: replay rebuilds terminal pixels from serialized bytes. Keep it off
+      // WebGL so stale atlas/canvas cells cannot survive restore + scroll.
+      manager.markPaneHasComplexScriptOutput(pane.id)
       replayIntoTerminal(pane, deps.replayingPanesRef, data)
     }
 
@@ -1925,10 +1925,16 @@ export function connectPanePty(
       // Why: hidden tab output is coalesced by the scheduler. Run per-byte
       // renderer checks at the xterm write boundary so background PTY bursts
       // do not spend foreground event-loop time scanning bytes we will delay.
-      if (terminalOutputChunkPrefersDomRenderer(chunk)) {
+      if (terminalOutputChunkPrefersDomRenderer(chunk) || containsNonAsciiOutput(chunk)) {
         manager.markPaneHasComplexScriptOutput(pane.id)
       }
       recordTerminalOutput(pane.terminal)
+    }
+
+    function markRendererRiskForSkippedOutput(): void {
+      // Why: hidden-output recovery skips xterm.write entirely, so WebGL does
+      // not see the bytes it would later need to repaint during restore/scroll.
+      manager.markPaneHasComplexScriptOutput(pane.id)
     }
 
     function consumeForegroundImmediateBudget(dataLength: number): boolean {
@@ -2098,16 +2104,18 @@ export function connectPanePty(
       }
     }
 
-    function shouldSkipHiddenRendererOutput(foreground: boolean): boolean {
-      return (
-        !foreground &&
-        !deps.isVisibleRef.current &&
-        canUseHiddenOutputSnapshot(transport.getPtyId()) &&
-        !isHiddenStartupRendererQueryWindowActive()
-      )
+    function shouldSkipHiddenRendererOutput(foreground: boolean, data: string): boolean {
+      void foreground
+      void data
+      // Why: release correctness beats the hidden-output perf optimization.
+      // Real OpenCode tables still corrupt after workspace switching when PTY
+      // bytes bypass the renderer, so keep hidden panes on the live xterm path
+      // and leave snapshot skipping for a later perf branch.
+      return false
     }
 
     function skipHiddenRendererOutput(data: string): void {
+      markRendererRiskForSkippedOutput()
       respondToSkippedMode2031Subscribe(data)
       markHiddenOutputRestoreNeeded()
       if (hiddenOutputRestoreInFlight) {
@@ -2511,7 +2519,7 @@ export function connectPanePty(
       const foreground = shouldWritePtyOutputForeground(deps.isVisibleRef.current)
       const restoreAppliesToCurrentPty =
         hiddenOutputRestorePtyId !== null && transport.getPtyId() === hiddenOutputRestorePtyId
-      if (shouldSkipHiddenRendererOutput(foreground)) {
+      if (shouldSkipHiddenRendererOutput(foreground, data)) {
         skipHiddenRendererOutput(data)
       } else if (
         (hiddenOutputRestoreNeeded || hiddenOutputRestoreInFlight) &&
