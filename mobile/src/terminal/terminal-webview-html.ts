@@ -47,7 +47,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.198/css/xterm.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.285/css/xterm.min.css">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
@@ -66,7 +66,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     transform-origin: top left;
     display: inline-block;
   }
-  .xterm { -webkit-user-select: none; user-select: none; }
+  .xterm { -webkit-user-select: none; user-select: none; font-variant-emoji: text; }
   .xterm .xterm-viewport {
     overflow-y: hidden !important;
     scrollbar-width: none !important;
@@ -192,12 +192,17 @@ export const XTERM_HTML = `<!DOCTYPE html>
     <button id="sel-menu-all">Select All</button>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.198/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.285/lib/xterm.min.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.10.0-beta.285/lib/addon-unicode11.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.20.0-beta.284/lib/addon-webgl.js"></script>
 <script>
 (function() {
   var surface = document.getElementById('terminal-surface');
   var ESC = String.fromCharCode(27);
   var C1_CSI = String.fromCharCode(155);
+  var CLAUDE_STATUS_DOT = String.fromCharCode(0x23fa);
+  var TEXT_PRESENTATION_SELECTOR = String.fromCharCode(0xfe0e);
+  var EMOJI_PRESENTATION_SELECTOR = String.fromCharCode(0xfe0f);
+  var CLAUDE_STATUS_DOT_PATTERN = new RegExp(CLAUDE_STATUS_DOT + '[' + TEXT_PRESENTATION_SELECTOR + EMOJI_PRESENTATION_SELECTOR + ']*', 'g');
+  var statusDotPendingSelector = false;
   var PRIVATE_MODE_SCAN_TAIL_LIMIT = 4096;
   var term = null;
   var scrollIndicator = document.getElementById('scroll-indicator');
@@ -552,8 +557,36 @@ export const XTERM_HTML = `<!DOCTYPE html>
     writeQueueHead = 0;
   }
 
+  function isStatusDotPresentationSelector(value) {
+    return value === TEXT_PRESENTATION_SELECTOR || value === EMOJI_PRESENTATION_SELECTOR;
+  }
+
+  function endsWithStatusDotPresentationSequence(data) {
+    var i = data.length - 1;
+    while (i >= 0 && isStatusDotPresentationSelector(data.charAt(i))) i--;
+    return i >= 0 && data.charAt(i) === CLAUDE_STATUS_DOT;
+  }
+
+  // Why: iOS WebKit promotes Claude's record/status dot to a colorful emoji glyph.
+  function normalizeStatusDotPresentation(data) {
+    if (typeof data !== 'string' || data.length === 0) return data;
+    if (statusDotPendingSelector) {
+      statusDotPendingSelector = false;
+      var strippedPendingSelectors = false;
+      while (data.length > 0 && isStatusDotPresentationSelector(data.charAt(0))) data = data.slice(1);
+      strippedPendingSelectors = data.length === 0;
+      if (strippedPendingSelectors) {
+        statusDotPendingSelector = true;
+        return '';
+      }
+    }
+    var normalized = data.replace(CLAUDE_STATUS_DOT_PATTERN, CLAUDE_STATUS_DOT + TEXT_PRESENTATION_SELECTOR);
+    statusDotPendingSelector = endsWithStatusDotPresentationSequence(data);
+    return normalized;
+  }
+
   function enqueueWrite(data) {
-    writeQueue.push(data);
+    writeQueue.push(normalizeStatusDotPresentation(data));
   }
 
   function nextQueuedWrite() {
@@ -632,6 +665,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     var gen = terminalGeneration;
     ready = false;
     resetWriteQueue();
+    statusDotPendingSelector = false;
     writesDraining = false;
     afterDrainCallbacks = [];
     initRows = rows || 24;
@@ -675,8 +709,10 @@ export const XTERM_HTML = `<!DOCTYPE html>
       cols: cols || 80,
       rows: rows || 24,
       theme: terminalTheme,
-      fontFamily: '"Menlo", "Consolas", "DejaVu Sans Mono", monospace',
+      fontFamily: '"SF Mono", "Menlo", "Monaco", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Liberation Mono", "Symbols Nerd Font Mono", monospace',
       fontSize: fontPxForScale(currentTextScale),
+      fontWeight: '300',
+      fontWeightBold: '500',
       scrollback: 5000,
       disableStdin: true,
       cursorBlink: false,
@@ -686,6 +722,10 @@ export const XTERM_HTML = `<!DOCTYPE html>
       allowProposedApi: true
     });
     term.open(surface);
+    if (window.WebglAddon && window.WebglAddon.WebglAddon) {
+      try { var webglAddon = new window.WebglAddon.WebglAddon(); term.loadAddon(webglAddon); if (webglAddon.onContextLoss) webglAddon.onContextLoss(function() { try { webglAddon && webglAddon.dispose && webglAddon.dispose(); } catch (e) {} }); } catch (e) {}
+    }
+    if (window.Unicode11Addon && window.Unicode11Addon.Unicode11Addon) try { term.loadAddon(new window.Unicode11Addon.Unicode11Addon()); term.unicode.activeVersion = '11'; } catch (e) {}
     if (typeof replayData === 'string' && replayData.length > 0) {
       enqueueWrite(replayData);
     }
@@ -833,6 +873,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     } else if (msg.type === 'clear') {
       terminalGeneration++;
       resetWriteQueue();
+      statusDotPendingSelector = false;
       afterDrainCallbacks = [];
       writesDraining = false;
       mouseModeScanTail = '';
