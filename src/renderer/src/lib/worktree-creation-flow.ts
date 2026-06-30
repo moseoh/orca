@@ -46,6 +46,7 @@ function buildStartupOpt(
     launchConfig: plan.launchConfig,
     ...(plan.launchToken ? { launchToken: plan.launchToken } : {}),
     ...(request.agent ? { launchAgent: request.agent } : {}),
+    ...(plan.draftPrompt ? { draftPrompt: plan.draftPrompt } : {}),
     ...(plan.startupCommandDelivery ? { startupCommandDelivery: plan.startupCommandDelivery } : {}),
     // Why: command-code shows its prompt in the tab status before the first
     // hook fires, so the prompt is threaded through here.

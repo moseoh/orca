@@ -128,6 +128,7 @@ import {
 } from './hidden-output-restore-scheduler'
 import {
   getExecutionHostIdForWorktree,
+  getSettingsForWorktreeRuntimeOwner,
   getRuntimeEnvironmentIdForWorktree
 } from '@/lib/worktree-runtime-owner'
 import { CLIENT_PLATFORM } from '@/lib/new-workspace'
@@ -149,6 +150,14 @@ import {
 } from '../../../../shared/agent-title-owner'
 import type { SetupSplitDirection, TuiAgent } from '../../../../shared/types'
 import { isWslUncPath } from '../../../../shared/wsl-paths'
+import { TUI_AGENT_CONFIG } from '../../../../shared/tui-agent-config'
+import { createDraftPasteReadyScanner } from '../../../../shared/draft-paste-ready-scanner'
+import { sendAgentDraftPasteContent } from '@/lib/agent-draft-paste-content'
+import {
+  beginAgentStartupDeliveryAttempt,
+  releaseAgentStartupDeliveryAttempt
+} from '@/lib/agent-startup-delayed-delivery'
+import { isExpectedAgentProcess } from '../../../../shared/agent-process-recognition'
 
 const pendingSpawnByPaneKey = new Map<string, Promise<string | null>>()
 const SSH_SESSION_EXPIRED_ERROR = 'SSH_SESSION_EXPIRED'
@@ -159,6 +168,8 @@ const AGENT_TASK_COMPLETE_NOTIFICATION_MAX_WAIT_MS = 1500
 const AGENT_TASK_COMPLETE_NOTIFICATION_DETAIL_MAX_AGE_MS = 10_000
 const COMMAND_CODE_OUTPUT_DONE_SETTLE_MS = 1500
 const SSH_SHELL_READY_STARTUP_FALLBACK_MS = 1500
+const STARTUP_DRAFT_PASTE_QUIET_MS = 1500
+const STARTUP_DRAFT_PASTE_TIMEOUT_MS = 8000
 const HIDDEN_OUTPUT_RESTORE_SCROLLBACK_ROWS = 5000
 const HIDDEN_OUTPUT_RESTORE_PENDING_CHARS = 512 * 1024
 const HIDDEN_OUTPUT_RESTORE_DEFERRED_RETRY_MS = 50
@@ -913,6 +924,7 @@ export function connectPanePty(
   let unregisterDocumentVisibilityRecovery: (() => void) | null = null
   let cleanupHiddenOutputRestoreDeferredRetry = (): void => {}
   let cleanupHiddenOutputRestoreForegroundDeadline = (): void => {}
+  let cleanupStartupDraftPasteTimers = (): void => {}
   let unregisterE2ePtyDataInjection = (): void => {}
   let startupInjectTimer: ReturnType<typeof setTimeout> | null = null
   let sshShellReadyFallbackTimer: ReturnType<typeof setTimeout> | null = null
@@ -1032,6 +1044,46 @@ export function connectPanePty(
   const launchToken = paneStartup?.launchConfig
     ? (paneStartup.launchToken ?? createBrowserUuid())
     : undefined
+  const startupDraftAgent = paneStartup?.launchAgent ?? paneStartup?.initialAgentStatus?.agent
+  const startupDraftAgentConfig = startupDraftAgent ? TUI_AGENT_CONFIG[startupDraftAgent] : null
+  const startupDraftPrompt =
+    typeof paneStartup?.draftPrompt === 'string' && paneStartup.draftPrompt.trim()
+      ? paneStartup.draftPrompt
+      : null
+  const startupDraftPromptNeedsPaste =
+    startupDraftPrompt !== null &&
+    !startupDraftAgentConfig?.draftPromptFlag &&
+    !startupDraftAgentConfig?.draftPromptEnvVar
+  let startupDraftDeliveryClaimed = false
+  let startupDraftPasteAttempted = false
+  const claimStartupDraftPasteDelivery = (): boolean => {
+    if (!startupDraftPromptNeedsPaste || launchToken === undefined) {
+      return false
+    }
+    if (startupDraftDeliveryClaimed) {
+      return true
+    }
+    // Why: launch-bound draft paste needs a launch token; all current
+    // draftPrompt startup callers pair it with launchConfig so this can safely
+    // fence off delayed sidecar delivery before Codex's first composer frame.
+    startupDraftDeliveryClaimed = beginAgentStartupDeliveryAttempt({
+      worktreeId: deps.worktreeId,
+      tabId: deps.tabId,
+      launchToken
+    })
+    return startupDraftDeliveryClaimed
+  }
+  const releaseUnattemptedStartupDraftPasteDelivery = (): void => {
+    if (!startupDraftDeliveryClaimed || startupDraftPasteAttempted || launchToken === undefined) {
+      return
+    }
+    releaseAgentStartupDeliveryAttempt({
+      worktreeId: deps.worktreeId,
+      tabId: deps.tabId,
+      launchToken
+    })
+    startupDraftDeliveryClaimed = false
+  }
   if (paneStartup?.launchConfig) {
     useAppStore.getState().registerAgentLaunchConfig(cacheKey, paneStartup.launchConfig, {
       agentType: paneStartup.launchAgent ?? paneStartup.initialAgentStatus?.agent,
@@ -2684,6 +2736,130 @@ export function connectPanePty(
       }
       schedulePendingStartupCommandDelivery()
     }
+    const ownsStartupDraftPaste = claimStartupDraftPasteDelivery()
+    const startupDraftReadyScanner = ownsStartupDraftPaste
+      ? createDraftPasteReadyScanner(
+          startupDraftAgentConfig?.draftPasteReadySignal ?? 'render-quiet-after-bracketed-paste'
+        )
+      : null
+    let startupDraftReadinessArmed = false
+    let startupDraftPasteSettled = !ownsStartupDraftPaste
+    let startupDraftPasteInFlight = false
+    let startupDraftQuietTimer: ReturnType<typeof setTimeout> | null = null
+    let startupDraftHardTimer: ReturnType<typeof setTimeout> | null = null
+    const clearStartupDraftPasteTimers = (): void => {
+      if (startupDraftQuietTimer !== null) {
+        clearTimeout(startupDraftQuietTimer)
+        startupDraftQuietTimer = null
+      }
+      if (startupDraftHardTimer !== null) {
+        clearTimeout(startupDraftHardTimer)
+        startupDraftHardTimer = null
+      }
+    }
+    cleanupStartupDraftPasteTimers = clearStartupDraftPasteTimers
+    const getStartupDraftPtyId = (): string | null => {
+      const ptyId = transport.getPtyId()
+      if (
+        !ptyId ||
+        disposed ||
+        deps.paneTransportsRef.current.get(pane.id) !== transport ||
+        transport.getPtyId() !== ptyId
+      ) {
+        return null
+      }
+      return ptyId
+    }
+    const sendStartupDraftPaste = (): void => {
+      if (
+        !startupDraftPrompt ||
+        startupDraftPasteSettled ||
+        startupDraftPasteInFlight ||
+        !startupDraftReadinessArmed
+      ) {
+        return
+      }
+      const ptyId = getStartupDraftPtyId()
+      if (!ptyId) {
+        return
+      }
+      startupDraftPasteInFlight = true
+      startupDraftPasteSettled = true
+      startupDraftPasteAttempted = true
+      cleanupStartupDraftPasteTimers()
+      const settings = getSettingsForWorktreeRuntimeOwner(useAppStore.getState(), deps.worktreeId)
+      void sendAgentDraftPasteContent(settings, ptyId, startupDraftPrompt)
+        .catch(() => false)
+        .finally(() => {
+          startupDraftPasteInFlight = false
+        })
+    }
+    const deliverStartupDraftIfAgentOwnsPty = async (): Promise<void> => {
+      if (!startupDraftAgentConfig || startupDraftPasteSettled) {
+        return
+      }
+      const ptyId = getStartupDraftPtyId()
+      if (!ptyId) {
+        return
+      }
+      const settings = getSettingsForWorktreeRuntimeOwner(useAppStore.getState(), deps.worktreeId)
+      try {
+        const process = await inspectRuntimeTerminalProcess(settings, ptyId)
+        const foreground = process.foregroundProcess?.toLowerCase() ?? ''
+        if (
+          getStartupDraftPtyId() === ptyId &&
+          isExpectedAgentProcess(foreground, startupDraftAgentConfig.expectedProcess)
+        ) {
+          sendStartupDraftPaste()
+        }
+      } catch {
+        // Best-effort fallback; the primary path is the PTY readiness marker.
+      }
+    }
+    const armStartupDraftHardTimer = (): void => {
+      if (!startupDraftReadyScanner || startupDraftPasteSettled || startupDraftHardTimer !== null) {
+        return
+      }
+      startupDraftHardTimer = setTimeout(() => {
+        startupDraftHardTimer = null
+        void deliverStartupDraftIfAgentOwnsPty()
+      }, STARTUP_DRAFT_PASTE_TIMEOUT_MS)
+    }
+    const armStartupDraftQuietTimer = (): void => {
+      if (!startupDraftReadyScanner || startupDraftPasteSettled) {
+        return
+      }
+      if (startupDraftQuietTimer !== null) {
+        clearTimeout(startupDraftQuietTimer)
+      }
+      startupDraftQuietTimer = setTimeout(() => {
+        startupDraftQuietTimer = null
+        sendStartupDraftPaste()
+      }, STARTUP_DRAFT_PASTE_QUIET_MS)
+    }
+    const armStartupDraftReadinessObservation = (): void => {
+      if (!startupDraftReadyScanner || startupDraftReadinessArmed) {
+        return
+      }
+      startupDraftReadinessArmed = true
+      armStartupDraftHardTimer()
+    }
+    const observeStartupDraftPasteReadiness = (data: string): void => {
+      if (!startupDraftReadyScanner || !startupDraftReadinessArmed || startupDraftPasteSettled) {
+        return
+      }
+      const scanned = startupDraftReadyScanner.observe(data)
+      if (scanned.ready) {
+        sendStartupDraftPaste()
+        return
+      }
+      if (scanned.armQuietTimer) {
+        armStartupDraftQuietTimer()
+      }
+    }
+    if (ownsStartupDraftPaste && !connectionId && !shouldDeliverStartupViaTerminalPaste) {
+      armStartupDraftReadinessObservation()
+    }
     let sessionRestoredBannerShown = false
     const showSessionRestoredBanner = (): void => {
       if (sessionRestoredBannerShown) {
@@ -2869,10 +3045,13 @@ export function connectPanePty(
             return
           }
           const command = startup.command
-          if (shouldDeliverStartupViaTerminalPaste) {
-            await runTerminalPasteStartupCommand(command)
+          const submitted = shouldDeliverStartupViaTerminalPaste
+            ? await runTerminalPasteStartupCommand(command)
+            : transport.sendInput(`${command}\r`)
+          if (submitted) {
+            armStartupDraftReadinessObservation()
           } else {
-            transport.sendInput(`${command}\r`)
+            releaseUnattemptedStartupDraftPasteDelivery()
           }
           pendingStartupCommand = null
         })()
@@ -4031,6 +4210,7 @@ export function connectPanePty(
         }
         data = scanned.output
       }
+      observeStartupDraftPasteReadiness(data)
       resetHiddenOutputRestoreIfPtyChanged()
       respondToTerminalPixelSizeQueries(data)
       observeTerminalBracketedPasteModeOutput(pane.terminal, data)
@@ -4912,6 +5092,8 @@ export function connectPanePty(
         clearTimeout(sshShellReadyFallbackTimer)
         sshShellReadyFallbackTimer = null
       }
+      cleanupStartupDraftPasteTimers()
+      releaseUnattemptedStartupDraftPasteDelivery()
       clearPendingAgentTaskCompleteNotification()
       pendingTerminalBellNotification = false
       clearTerminalBellNotificationTimer()

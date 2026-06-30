@@ -13,6 +13,10 @@ import { makePaneKey } from '../../../../shared/stable-pane-id'
 import type { TerminalLayoutSnapshot } from '../../../../shared/types'
 import { YOLO_TUI_AGENT_ARGS } from '../../../../shared/tui-agent-permissions'
 import { SETUP_AGENT_SEQUENCE_STARTUP_COMMAND_ENV } from '../../../../shared/setup-agent-sequencing'
+import {
+  beginAgentStartupDeliveryAttempt,
+  resetAgentStartupDelayedDeliveryForTests
+} from '@/lib/agent-startup-delayed-delivery'
 
 // Repro command:
 //   pnpm exec vitest run --config config/vitest.config.ts src/renderer/src/components/terminal-pane/pty-connection.test.ts -t "OpenTUI-style small ANSI redraw"
@@ -666,6 +670,8 @@ describe('connectPanePty', () => {
           getMainBufferSnapshot: vi.fn().mockResolvedValue(null),
           getForegroundProcess: vi.fn().mockResolvedValue(null),
           hasChildProcesses: vi.fn().mockResolvedValue(false),
+          write: vi.fn(),
+          writeAccepted: vi.fn().mockResolvedValue(true),
           ackColdRestore: vi.fn(),
           onClearBufferRequest: vi.fn(() => vi.fn()),
           onSerializeBufferRequest: vi.fn(() => vi.fn()),
@@ -716,6 +722,7 @@ describe('connectPanePty', () => {
     }
     delete (globalThis as unknown as { window?: unknown }).window
     delete (globalThis as Record<string, unknown>).__ptyConnectDiag
+    resetAgentStartupDelayedDeliveryForTests()
   })
 
   it('does not retain PTY connect diagnostics unless e2e debug state is enabled', async () => {
@@ -3090,6 +3097,86 @@ describe('connectPanePty', () => {
     } finally {
       globalThis.setTimeout = originalSetTimeout
     }
+  })
+
+  it('pastes a startup draft when Codex renders its composer in the first observed output', async () => {
+    const { connectPanePty } = await import('./pty-connection')
+
+    const capturedDataCallback: { current: ((data: string) => void) | null } = { current: null }
+    const transport = createMockTransport('pty-codex')
+    transport.connect.mockImplementation(async ({ callbacks }: { callbacks: ConnectCallbacks }) => {
+      capturedDataCallback.current = callbacks.onData ?? null
+      return 'pty-codex'
+    })
+    transportFactoryQueue.push(transport)
+
+    mockStoreState = {
+      ...mockStoreState,
+      tabsByWorktree: { 'wt-1': [{ id: 'tab-1', ptyId: null }] },
+      repos: [{ id: 'repo1', connectionId: null }]
+    }
+
+    const pane = createPane(1)
+    const manager = createManager(1)
+    const deps = createDeps({
+      startup: {
+        command: 'codex',
+        launchAgent: 'codex',
+        launchConfig: { agentArgs: '', agentEnv: {} },
+        launchToken: 'launch-token-1',
+        draftPrompt: 'https://github.com/stablyai/orca/issues/42'
+      }
+    })
+
+    connectPanePty(pane as never, manager as never, deps as never)
+    await flushAsyncTicks()
+    expect(capturedDataCallback.current).not.toBeNull()
+
+    capturedDataCallback.current?.('\x1b[?2004h\x1b[2K› ')
+    await flushAsyncTicks()
+
+    expect(window.api.pty.writeAccepted).toHaveBeenCalledWith(
+      'pty-codex',
+      '\x1b[200~https://github.com/stablyai/orca/issues/42\x1b[201~'
+    )
+  })
+
+  it('does not consume startup draft delivery before deferred connect starts', async () => {
+    const { connectPanePty } = await import('./pty-connection')
+    globalThis.requestAnimationFrame = vi.fn(() => 1)
+    const transport = createMockTransport('pty-codex')
+    transportFactoryQueue.push(transport)
+
+    mockStoreState = {
+      ...mockStoreState,
+      tabsByWorktree: { 'wt-1': [{ id: 'tab-1', ptyId: null }] },
+      repos: [{ id: 'repo1', connectionId: null }]
+    }
+
+    const binding = connectPanePty(
+      createPane(1) as never,
+      createManager(1) as never,
+      createDeps({
+        startup: {
+          command: 'codex',
+          launchAgent: 'codex',
+          launchConfig: { agentArgs: '', agentEnv: {} },
+          launchToken: 'launch-token-1',
+          draftPrompt: 'https://github.com/stablyai/orca/issues/42'
+        }
+      }) as never
+    )
+
+    binding.dispose()
+
+    expect(transport.connect).not.toHaveBeenCalled()
+    expect(
+      beginAgentStartupDeliveryAttempt({
+        worktreeId: 'wt-1',
+        tabId: 'tab-1',
+        launchToken: 'launch-token-1'
+      })
+    ).toBe(true)
   })
 
   it('falls back for SSH shell-ready startup commands when no marker arrives', async () => {
