@@ -52,7 +52,7 @@ import {
   resolveEffectiveGitUpstream
 } from '../shared/git-effective-upstream'
 import { loadGitHistoryFromExecutor } from '../shared/git-history'
-import { buildRelayCommandEnv } from './relay-command-env'
+import { buildRelayGitEnv } from './relay-command-env'
 import {
   removeSafeUntrackedDiscardTarget,
   removeSafeUntrackedDiscardTargets
@@ -254,7 +254,7 @@ export class GitHandler {
       stdin?: string
     }
   ): Promise<{ stdout: string; stderr: string }> {
-    const env = buildRelayCommandEnv()
+    const env = buildRelayGitEnv()
     if (opts?.disableOptionalLocks) {
       env.GIT_OPTIONAL_LOCKS = '0'
     }
@@ -281,7 +281,7 @@ export class GitHandler {
   private async gitBuffer(args: string[], cwd: string): Promise<Buffer> {
     const { stdout } = (await execFileAsync('git', args, {
       cwd,
-      env: buildRelayCommandEnv(),
+      env: buildRelayGitEnv(),
       encoding: 'buffer',
       maxBuffer: MAX_GIT_BUFFER
     })) as { stdout: Buffer }
@@ -1097,7 +1097,7 @@ export class GitHandler {
     return await new Promise((resolve, reject) => {
       const child = spawn('git', args, {
         cwd: expandTilde(cwd),
-        env: buildRelayCommandEnv(),
+        env: buildRelayGitEnv(),
         stdio: ['ignore', 'pipe', 'pipe']
       })
       let stdout = ''

@@ -41,7 +41,7 @@ import {
   AGENT_PROMPT_SUBMIT_DELAY_MS,
   buildAgentPromptPasteBytes
 } from '../../shared/agent-prompt-injection'
-import { gitExecFileAsync, wslAwareSpawn } from '../git/runner'
+import { gitExecFileAsync, gitSpawn } from '../git/runner'
 import {
   cleanupClaimedCloneTarget,
   claimCloneTarget,
@@ -10692,9 +10692,9 @@ export class OrcaRuntimeService {
     await mkdir(trimmedDestination, { recursive: true })
     const claimedTarget = await claimCloneTarget(clonePath)
     await new Promise<void>((resolve, reject) => {
-      let proc: ReturnType<typeof wslAwareSpawn>
+      let proc: ReturnType<typeof gitSpawn>
       try {
-        proc = wslAwareSpawn('git', ['clone', '--progress', '--', trimmedUrl, clonePath], {
+        proc = gitSpawn(['clone', '--progress', '--', trimmedUrl, clonePath], {
           cwd: trimmedDestination,
           stdio: ['ignore', 'ignore', 'pipe']
         })
