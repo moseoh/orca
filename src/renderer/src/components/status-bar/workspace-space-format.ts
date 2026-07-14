@@ -3,9 +3,9 @@ import type {
   WorkspaceSpaceScanStatus,
   WorkspaceSpaceWorktree
 } from '../../../../shared/workspace-space-types'
+import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
 
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'] as const
-const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
 const fullDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: 'medium',
   timeStyle: 'short'
@@ -44,16 +44,16 @@ export function getWorkspaceSpaceScanTimeLabel(scannedAt: number, now = Date.now
   const diffMs = scannedAt - now
   const diffMinutes = Math.round(diffMs / 60_000)
   if (Math.abs(diffMinutes) < 60) {
-    return relativeTimeFormatter.format(diffMinutes, 'minute')
+    return getUiRelativeTimeFormatter().format(diffMinutes, 'minute')
   }
 
   const diffHours = Math.round(diffMinutes / 60)
   if (Math.abs(diffHours) < 24) {
-    return relativeTimeFormatter.format(diffHours, 'hour')
+    return getUiRelativeTimeFormatter().format(diffHours, 'hour')
   }
 
   const diffDays = Math.round(diffHours / 24)
-  return relativeTimeFormatter.format(diffDays, 'day')
+  return getUiRelativeTimeFormatter().format(diffDays, 'day')
 }
 
 export function getWorkspaceSpaceScanDateTimeLabel(scannedAt: number): string {

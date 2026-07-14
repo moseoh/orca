@@ -50,6 +50,7 @@ import {
   linearUpdateIssue
 } from '@/runtime/runtime-linear-client'
 import { translate } from '@/i18n/i18n'
+import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
 
 function LinearIcon({ className }: { className?: string }): React.JSX.Element {
   return (
@@ -107,7 +108,7 @@ function formatRelativeTime(input: string): string {
   }
   const diffMs = date.getTime() - Date.now()
   const diffMinutes = Math.round(diffMs / 60_000)
-  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
+  const formatter = getUiRelativeTimeFormatter()
   if (Math.abs(diffMinutes) < 60) {
     return formatter.format(diffMinutes, 'minute')
   }

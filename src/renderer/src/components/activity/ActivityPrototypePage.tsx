@@ -73,6 +73,7 @@ import {
   resolveActivityThreadStatusPreview
 } from '@/lib/activity-thread-display'
 import { getAgentRowPrimaryText } from '@/lib/agent-row-primary-text'
+import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
 
 type ThreadReadFilter = 'all' | 'unread'
 type ActivityGroupBy = 'status' | 'project' | 'worktree' | 'agent'
@@ -165,8 +166,6 @@ const absoluteDateFormatter = new Intl.DateTimeFormat(undefined, {
   minute: '2-digit'
 })
 
-const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
-
 function formatAbsoluteDate(timestamp: number): string {
   return absoluteDateFormatter.format(new Date(timestamp))
 }
@@ -175,14 +174,14 @@ function formatRelativeTime(timestamp: number): string {
   const diffMs = timestamp - Date.now()
   const diffMinutes = Math.round(diffMs / 60_000)
   if (Math.abs(diffMinutes) < 60) {
-    return relativeTimeFormatter.format(diffMinutes, 'minute')
+    return getUiRelativeTimeFormatter().format(diffMinutes, 'minute')
   }
   const diffHours = Math.round(diffMinutes / 60)
   if (Math.abs(diffHours) < 24) {
-    return relativeTimeFormatter.format(diffHours, 'hour')
+    return getUiRelativeTimeFormatter().format(diffHours, 'hour')
   }
   const diffDays = Math.round(diffHours / 24)
-  return relativeTimeFormatter.format(diffDays, 'day')
+  return getUiRelativeTimeFormatter().format(diffDays, 'day')
 }
 
 function findActivityTerminalPane(

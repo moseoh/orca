@@ -226,6 +226,7 @@ import {
   validateTaskPageGitHubDuplicateTarget,
   type TaskPageGitHubCloseAction
 } from '@/components/task-page-github-status-actions'
+import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
 
 // Why: the GH item dialog can be opened from any work-item list surface and
 // doesn't have the full owner/repo context the list's cache entry carries.
@@ -345,7 +346,7 @@ function formatRelativeTime(input: string): string {
   }
   const diffMs = date.getTime() - Date.now()
   const diffMinutes = Math.round(diffMs / 60_000)
-  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
+  const formatter = getUiRelativeTimeFormatter()
   if (Math.abs(diffMinutes) < 60) {
     return formatter.format(diffMinutes, 'minute')
   }

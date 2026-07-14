@@ -82,6 +82,7 @@ import {
   selectCodexProviderAccount,
   watchProviderAccounts
 } from '@/runtime/runtime-provider-accounts-client'
+import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
 
 export { getAccountsPaneSearchEntries }
 
@@ -93,7 +94,7 @@ function formatMiniMaxRelativeRefresh(updatedAt: number, now: number): string {
   if (diffMs < 60_000) {
     return translate('auto.components.settings.AccountsPane.3a30aaf526', 'just now')
   }
-  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
+  const formatter = getUiRelativeTimeFormatter()
   const minutes = Math.round(diffMs / 60_000)
   if (minutes < 60) {
     return formatter.format(-minutes, 'minute')
