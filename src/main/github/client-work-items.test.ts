@@ -627,15 +627,17 @@ describe('listWorkItems', () => {
     )
   })
 
-  it('combines the updatedAt cursor with updated-desc ordering on later pages', async () => {
+  it('combines the inclusive updatedAt cursor with updated-desc ordering on later pages', async () => {
     getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'acme', repo: 'widgets' })
     getOwnerRepoMock.mockResolvedValueOnce({ owner: 'acme', repo: 'widgets' })
     ghExecFileAsyncMock.mockResolvedValueOnce({ stdout: '[]' })
 
     await listWorkItems('/repo-root', 10, 'is:issue is:open', '2026-07-01T00:00:00Z')
 
+    // Why: the bound is inclusive (`<=`) so boundary items sharing the cursor's
+    // exact updatedAt aren't skipped; the renderer dedupes the re-fetched rows.
     expect(ghExecFileAsyncMock).toHaveBeenCalledWith(
-      expect.arrayContaining(['--search', 'updated:<2026-07-01T00:00:00Z sort:updated-desc']),
+      expect.arrayContaining(['--search', 'updated:<=2026-07-01T00:00:00Z sort:updated-desc']),
       { cwd: '/repo-root' }
     )
   })
