@@ -76,4 +76,40 @@ describe('fetchCodexRateLimits PTY settle timers', () => {
       status: 'ok'
     })
   })
+
+  it('keeps the reset text on the weekly window for weekly-only plans', async () => {
+    const ptyHandlers: { onData?: (data: string) => void } = {}
+
+    childSpawnMock.mockImplementation(() => {
+      throw new Error('rpc unavailable')
+    })
+    ptySpawnMock.mockReturnValue({
+      onData: vi.fn((callback) => {
+        ptyHandlers.onData = callback
+        return makeDisposable()
+      }),
+      onExit: vi.fn(() => makeDisposable()),
+      write: vi.fn(),
+      kill: vi.fn()
+    })
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const onPtyData = ptyHandlers.onData
+    if (!onPtyData) {
+      throw new Error('PTY data handler was not registered')
+    }
+
+    onPtyData('>')
+    onPtyData('Weekly limit: 76%\nResets in 5d 23h\n')
+
+    await vi.advanceTimersByTimeAsync(500)
+
+    await expect(resultPromise).resolves.toMatchObject({
+      session: null,
+      weekly: { usedPercent: 76, resetDescription: '5d 23h' },
+      status: 'ok'
+    })
+  })
 })

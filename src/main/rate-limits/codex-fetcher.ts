@@ -827,10 +827,12 @@ function parsePtyStatus(output: string): {
       }
     : null
 
-  // Try to extract reset time from surrounding text
+  // Try to extract reset time from surrounding text. Weekly-only plans have
+  // no session window, so fall back to the weekly one instead of dropping it.
   const resetMatch = RESET_TEXT_RE.exec(output)
-  if (resetMatch && session) {
-    session.resetDescription = resetMatch[1].trim()
+  const resetTarget = session ?? weekly
+  if (resetMatch && resetTarget) {
+    resetTarget.resetDescription = resetMatch[1].trim()
   }
 
   return { session, weekly }
