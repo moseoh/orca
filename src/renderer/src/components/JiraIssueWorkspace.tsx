@@ -62,15 +62,16 @@ function formatRelativeTime(input: string): string {
   if (Number.isNaN(date.getTime())) {
     return 'recently'
   }
+  const formatter = getUiRelativeTimeFormatter()
   const diffMinutes = Math.round((date.getTime() - Date.now()) / 60_000)
   if (Math.abs(diffMinutes) < 60) {
-    return getUiRelativeTimeFormatter().format(diffMinutes, 'minute')
+    return formatter.format(diffMinutes, 'minute')
   }
   const diffHours = Math.round(diffMinutes / 60)
   if (Math.abs(diffHours) < 24) {
-    return getUiRelativeTimeFormatter().format(diffHours, 'hour')
+    return formatter.format(diffHours, 'hour')
   }
-  return getUiRelativeTimeFormatter().format(Math.round(diffHours / 24), 'day')
+  return formatter.format(Math.round(diffHours / 24), 'day')
 }
 
 function buildJiraBranchName(issue: JiraIssue): string {

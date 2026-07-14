@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 
-const mockI18n = { language: 'en', resolvedLanguage: 'en' as string | undefined }
+const { mockI18n } = vi.hoisted(() => ({
+  mockI18n: { language: 'en', resolvedLanguage: 'en' as string | undefined }
+}))
 
 vi.mock('./i18n', () => ({ i18n: mockI18n }))
 

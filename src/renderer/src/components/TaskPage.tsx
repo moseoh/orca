@@ -577,20 +577,21 @@ function formatRelativeTime(input: string): string {
     return 'recently'
   }
 
+  const formatter = getUiRelativeTimeFormatter()
   const diffMs = date.getTime() - Date.now()
   const diffMinutes = Math.round(diffMs / 60_000)
 
   if (Math.abs(diffMinutes) < 60) {
-    return getUiRelativeTimeFormatter().format(diffMinutes, 'minute')
+    return formatter.format(diffMinutes, 'minute')
   }
 
   const diffHours = Math.round(diffMinutes / 60)
   if (Math.abs(diffHours) < 24) {
-    return getUiRelativeTimeFormatter().format(diffHours, 'hour')
+    return formatter.format(diffHours, 'hour')
   }
 
   const diffDays = Math.round(diffHours / 24)
-  return getUiRelativeTimeFormatter().format(diffDays, 'day')
+  return formatter.format(diffDays, 'day')
 }
 
 type LinearProjectTab = 'overview' | 'issues'
