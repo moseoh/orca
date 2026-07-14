@@ -3,7 +3,7 @@ import type {
   WorkspaceSpaceScanStatus,
   WorkspaceSpaceWorktree
 } from '../../../../shared/workspace-space-types'
-import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
+import { formatUiRelativeTime } from '@/i18n/relative-time-format'
 
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'] as const
 const fullDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -41,20 +41,7 @@ export function formatCompactCount(count: number): string {
 }
 
 export function getWorkspaceSpaceScanTimeLabel(scannedAt: number, now = Date.now()): string {
-  const formatter = getUiRelativeTimeFormatter()
-  const diffMs = scannedAt - now
-  const diffMinutes = Math.round(diffMs / 60_000)
-  if (Math.abs(diffMinutes) < 60) {
-    return formatter.format(diffMinutes, 'minute')
-  }
-
-  const diffHours = Math.round(diffMinutes / 60)
-  if (Math.abs(diffHours) < 24) {
-    return formatter.format(diffHours, 'hour')
-  }
-
-  const diffDays = Math.round(diffHours / 24)
-  return formatter.format(diffDays, 'day')
+  return formatUiRelativeTime(scannedAt - now)
 }
 
 export function getWorkspaceSpaceScanDateTimeLabel(scannedAt: number): string {

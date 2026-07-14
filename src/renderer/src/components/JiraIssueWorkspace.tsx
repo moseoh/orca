@@ -48,7 +48,7 @@ import type {
 } from '../../../shared/types'
 import type { TaskSourceContext } from '../../../shared/task-source-context'
 import { translate } from '@/i18n/i18n'
-import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
+import { formatUiRelativeTimeFromDate } from '@/i18n/relative-time-format'
 
 type JiraIssueWorkspaceProps = {
   issue: JiraIssue | null
@@ -58,20 +58,7 @@ type JiraIssueWorkspaceProps = {
 }
 
 function formatRelativeTime(input: string): string {
-  const date = new Date(input)
-  if (Number.isNaN(date.getTime())) {
-    return 'recently'
-  }
-  const formatter = getUiRelativeTimeFormatter()
-  const diffMinutes = Math.round((date.getTime() - Date.now()) / 60_000)
-  if (Math.abs(diffMinutes) < 60) {
-    return formatter.format(diffMinutes, 'minute')
-  }
-  const diffHours = Math.round(diffMinutes / 60)
-  if (Math.abs(diffHours) < 24) {
-    return formatter.format(diffHours, 'hour')
-  }
-  return formatter.format(Math.round(diffHours / 24), 'day')
+  return formatUiRelativeTimeFromDate(input)
 }
 
 function buildJiraBranchName(issue: JiraIssue): string {

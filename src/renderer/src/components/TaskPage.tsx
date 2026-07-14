@@ -364,7 +364,7 @@ import {
   type LinearOrderBy,
   type LinearViewMode
 } from '@/components/task-page-localized-options'
-import { getUiRelativeTimeFormatter } from '@/i18n/relative-time-format'
+import { formatUiRelativeTimeFromDate } from '@/i18n/relative-time-format'
 
 function isGitLabMRFilter(value: GitLabTaskFilter | GitLabIssueFilter): value is GitLabTaskFilter {
   return value === 'opened' || value === 'merged' || value === 'closed' || value === 'all'
@@ -572,26 +572,7 @@ function scopeGitHubTaskSearch(query: string, kind: GitHubTaskKind): string {
 }
 
 function formatRelativeTime(input: string): string {
-  const date = new Date(input)
-  if (Number.isNaN(date.getTime())) {
-    return 'recently'
-  }
-
-  const formatter = getUiRelativeTimeFormatter()
-  const diffMs = date.getTime() - Date.now()
-  const diffMinutes = Math.round(diffMs / 60_000)
-
-  if (Math.abs(diffMinutes) < 60) {
-    return formatter.format(diffMinutes, 'minute')
-  }
-
-  const diffHours = Math.round(diffMinutes / 60)
-  if (Math.abs(diffHours) < 24) {
-    return formatter.format(diffHours, 'hour')
-  }
-
-  const diffDays = Math.round(diffHours / 24)
-  return formatter.format(diffDays, 'day')
+  return formatUiRelativeTimeFromDate(input)
 }
 
 type LinearProjectTab = 'overview' | 'issues'
