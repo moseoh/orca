@@ -1010,9 +1010,12 @@ function buildWorkItemListArgs(args: {
   if (query.freeText) {
     searchParts.push(query.freeText)
   }
-  if (searchParts.length > 0) {
-    out.push('--search', searchParts.join(' '))
-  }
+  // Why: pagination cursors slice on updatedAt, but `gh issue list` defaults
+  // to created-desc and `--search` defaults to best-match. Without pinning the
+  // sort, recently-updated old items never appear on any page, so the pager
+  // advertises pages the fetch chain can never reach (#8649).
+  searchParts.push('sort:updated-desc')
+  out.push('--search', searchParts.join(' '))
   return out
 }
 
