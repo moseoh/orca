@@ -382,43 +382,34 @@ describe('createGitHubSlice.setIssueSourcePreference', () => {
     } as unknown as Partial<AppState>)
   }
 
-  it('evicts source-context-scoped work-item entries on a preference flip', async () => {
+  it('keeps both sources cached under separate keys across a preference flip', async () => {
+    // Why: the preference is part of the work-item cache key, so a flip must
+    // not evict the other side — toggling back serves its still-fresh entry
+    // instantly. The nonce bump is what re-runs the Tasks fetch effect.
     const store = createTestStore()
     const repoId = 'repo-1'
     const repoPath = '/repo/one'
     seedRepo(store, repoId, repoPath)
-    const scopedKey = workItemsCacheKey(
-      repoId,
-      20,
-      '',
-      getTaskSourceCacheScope(githubSourceContext('local', repoId))
-    )
-    const bareKey = workItemsCacheKey(repoId, 20, '')
-    const otherRepoScopedKey = workItemsCacheKey(
-      'repo-2',
-      20,
-      '',
-      getTaskSourceCacheScope(githubSourceContext('local', 'repo-2'))
-    )
+    const scope = getTaskSourceCacheScope(githubSourceContext('local', repoId))
+    const upstreamKey = workItemsCacheKey(repoId, 20, '', scope, 'upstream')
+    const originKey = workItemsCacheKey(repoId, 20, '', scope, 'origin')
+    expect(upstreamKey).not.toBe(originKey)
     store.setState({
       workItemsInvalidationNonce: 4,
       workItemsCache: {
-        [scopedKey]: { data: [], fetchedAt: Date.now() },
-        [bareKey]: { data: [], fetchedAt: Date.now() },
-        [otherRepoScopedKey]: { data: [], fetchedAt: Date.now() }
+        [upstreamKey]: { data: [], fetchedAt: Date.now() }
       }
     })
 
     await store.getState().setIssueSourcePreference(repoId, repoPath, 'origin')
     const state = store.getState()
 
-    expect(state.workItemsCache[scopedKey]).toBeUndefined()
-    expect(state.workItemsCache[bareKey]).toBeUndefined()
-    expect(state.workItemsCache[otherRepoScopedKey]).toBeDefined()
+    expect(state.workItemsCache[upstreamKey]).toBeDefined()
     expect(state.workItemsInvalidationNonce).toBe(5)
+    expect(state.repos[0]?.issueSourcePreference).toBe('origin')
   })
 
-  it('clears source-context-scoped in-flight dedupe entries so the post-flip fetch re-dispatches', async () => {
+  it('does not dedupe the post-flip fetch onto a pre-flip in-flight request', async () => {
     const store = createTestStore()
     const repoId = 'repo-1'
     const repoPath = '/repo/one'
@@ -438,8 +429,9 @@ describe('createGitHubSlice.setIssueSourcePreference', () => {
       )
       .mockResolvedValueOnce(emptyEnvelope)
 
-    // Why: a pre-flip request left in the dedupe map would swallow the
-    // post-flip fetch, so the new preference's list never actually runs.
+    // Why: a pre-flip request swallowing the post-flip fetch would mean the
+    // new preference's list never actually runs. Preference-scoped keys give
+    // the post-flip fetch its own dedupe slot.
     const firstFetch = store.getState().fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
     await Promise.resolve()
     await store.getState().setIssueSourcePreference(repoId, repoPath, 'origin')
@@ -448,6 +440,78 @@ describe('createGitHubSlice.setIssueSourcePreference', () => {
     await firstFetch
     await secondFetch
 
+    expect(mockApi.gh.listWorkItems).toHaveBeenCalledTimes(2)
+  })
+
+  it('shares one entry between auto and an explicit upstream pin', async () => {
+    // Why: 'auto' routes upstream-first exactly like an explicit 'upstream'
+    // pick, so pinning the already-highlighted pill must be a cache hit —
+    // not a spurious refetch of identical data under a different key.
+    const store = createTestStore()
+    const repoId = 'repo-1'
+    const repoPath = '/repo/one'
+    seedRepo(store, repoId, repoPath)
+    const sourceContext = githubSourceContext('local', repoId)
+    const scope = getTaskSourceCacheScope(sourceContext)
+    expect(workItemsCacheKey(repoId, 20, '', scope)).toBe(
+      workItemsCacheKey(repoId, 20, '', scope, 'upstream')
+    )
+    const item = {
+      type: 'issue',
+      number: 3,
+      title: 'Upstream issue',
+      url: 'https://example.test/3',
+      updatedAt: '2026-07-14T00:00:00Z'
+    } as GitHubWorkItem
+    mockApi.gh.listWorkItems.mockResolvedValueOnce({
+      items: [item],
+      sources: { issues: null, prs: null, originCandidate: null, upstreamCandidate: null }
+    })
+
+    await store.getState().fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
+    await store.getState().setIssueSourcePreference(repoId, repoPath, 'upstream')
+    const pinned = await store
+      .getState()
+      .fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
+
+    expect(pinned).toEqual([{ ...item, repoId }])
+    expect(mockApi.gh.listWorkItems).toHaveBeenCalledTimes(1)
+  })
+
+  it("serves the previous source's still-fresh cache when toggling back", async () => {
+    const store = createTestStore()
+    const repoId = 'repo-1'
+    const repoPath = '/repo/one'
+    seedRepo(store, repoId, repoPath)
+    const sourceContext = githubSourceContext('local', repoId)
+    const upstreamItem = {
+      type: 'pr',
+      number: 7,
+      title: 'Upstream PR',
+      url: 'https://example.test/7',
+      updatedAt: '2026-07-14T00:00:00Z'
+    } as GitHubWorkItem
+    mockApi.gh.listWorkItems
+      .mockResolvedValueOnce({
+        items: [upstreamItem],
+        sources: { issues: null, prs: null, originCandidate: null, upstreamCandidate: null }
+      })
+      .mockResolvedValueOnce({
+        items: [],
+        sources: { issues: null, prs: null, originCandidate: null, upstreamCandidate: null }
+      })
+
+    await store.getState().setIssueSourcePreference(repoId, repoPath, 'upstream')
+    await store.getState().fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
+    await store.getState().setIssueSourcePreference(repoId, repoPath, 'origin')
+    await store.getState().fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
+    await store.getState().setIssueSourcePreference(repoId, repoPath, 'upstream')
+    const toggledBack = await store
+      .getState()
+      .fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
+
+    expect(toggledBack).toEqual([{ ...upstreamItem, repoId }])
+    // Why: two network calls total — the toggle back must be a cache hit.
     expect(mockApi.gh.listWorkItems).toHaveBeenCalledTimes(2)
   })
 })
