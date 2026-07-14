@@ -60,6 +60,9 @@ const mockApi = {
     getCreationEligibility: vi.fn(),
     create: vi.fn()
   },
+  repos: {
+    update: vi.fn().mockResolvedValue(undefined)
+  },
   runtimeEnvironments: {
     call: runtimeEnvironmentTransportCall
   },
@@ -320,6 +323,132 @@ describe('createGitHubSlice.evictGitHubRepoCaches', () => {
 
     await expect(firstFetch).resolves.toEqual([{ ...item, repoId: 'repo-1' }])
     expect(store.getState().workItemsCache[workItemsCacheKey('repo-1', 20, '')]).toBeUndefined()
+  })
+
+  it('evicts source-context-scoped work-item entries too', () => {
+    // Why: TaskPage keys its work-item cache with a task-source scope prefix
+    // (github:local:...::repoId::…) even for plain local repos. Eviction that
+    // only matches bare repoId::/repoPath:: prefixes silently skips every
+    // TaskPage entry, so a preference flip serves stale-source rows forever.
+    const store = createTestStore()
+    const repoId = 'repo-1'
+    const repoPath = '/repo/one'
+    const scopedKey = workItemsCacheKey(
+      repoId,
+      20,
+      '',
+      getTaskSourceCacheScope(githubSourceContext('local', repoId))
+    )
+    const otherRepoScopedKey = workItemsCacheKey(
+      'repo-2',
+      20,
+      '',
+      getTaskSourceCacheScope(githubSourceContext('local', 'repo-2'))
+    )
+    store.setState({
+      workItemsInvalidationNonce: 4,
+      workItemsCache: {
+        [scopedKey]: { data: [], fetchedAt: 1 },
+        [otherRepoScopedKey]: { data: [], fetchedAt: 1 }
+      }
+    })
+
+    store.getState().evictGitHubRepoCaches(repoId, repoPath)
+    const state = store.getState()
+
+    expect(state.workItemsCache[scopedKey]).toBeUndefined()
+    expect(state.workItemsCache[otherRepoScopedKey]).toBeDefined()
+    expect(state.workItemsInvalidationNonce).toBe(5)
+  })
+})
+
+describe('createGitHubSlice.setIssueSourcePreference', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetRemoteRuntimeMocks()
+    mockApi.repos.update.mockResolvedValue(undefined)
+  })
+
+  // Why: while the eviction bug is unfixed, the deduped second fetch leaves a
+  // queued once-response unconsumed; reset so it cannot leak into later suites.
+  afterEach(() => {
+    mockApi.gh.listWorkItems.mockReset()
+    mockApi.repos.update.mockReset()
+  })
+
+  function seedRepo(store: ReturnType<typeof createTestStore>, repoId: string, repoPath: string) {
+    store.setState({
+      repos: [{ id: repoId, path: repoPath, name: 'repo', kind: 'git' }]
+    } as unknown as Partial<AppState>)
+  }
+
+  it('evicts source-context-scoped work-item entries on a preference flip', async () => {
+    const store = createTestStore()
+    const repoId = 'repo-1'
+    const repoPath = '/repo/one'
+    seedRepo(store, repoId, repoPath)
+    const scopedKey = workItemsCacheKey(
+      repoId,
+      20,
+      '',
+      getTaskSourceCacheScope(githubSourceContext('local', repoId))
+    )
+    const bareKey = workItemsCacheKey(repoId, 20, '')
+    const otherRepoScopedKey = workItemsCacheKey(
+      'repo-2',
+      20,
+      '',
+      getTaskSourceCacheScope(githubSourceContext('local', 'repo-2'))
+    )
+    store.setState({
+      workItemsInvalidationNonce: 4,
+      workItemsCache: {
+        [scopedKey]: { data: [], fetchedAt: Date.now() },
+        [bareKey]: { data: [], fetchedAt: Date.now() },
+        [otherRepoScopedKey]: { data: [], fetchedAt: Date.now() }
+      }
+    })
+
+    await store.getState().setIssueSourcePreference(repoId, repoPath, 'origin')
+    const state = store.getState()
+
+    expect(state.workItemsCache[scopedKey]).toBeUndefined()
+    expect(state.workItemsCache[bareKey]).toBeUndefined()
+    expect(state.workItemsCache[otherRepoScopedKey]).toBeDefined()
+    expect(state.workItemsInvalidationNonce).toBe(5)
+  })
+
+  it('clears source-context-scoped in-flight dedupe entries so the post-flip fetch re-dispatches', async () => {
+    const store = createTestStore()
+    const repoId = 'repo-1'
+    const repoPath = '/repo/one'
+    seedRepo(store, repoId, repoPath)
+    const sourceContext = githubSourceContext('local', repoId)
+    const emptyEnvelope = {
+      items: [],
+      sources: { issues: null, prs: null, originCandidate: null, upstreamCandidate: null }
+    }
+    let resolveFirst: (value: typeof emptyEnvelope) => void = () => {}
+    mockApi.gh.listWorkItems
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve
+          })
+      )
+      .mockResolvedValueOnce(emptyEnvelope)
+
+    // Why: a pre-flip request left in the dedupe map would swallow the
+    // post-flip fetch, so the new preference's list never actually runs.
+    const firstFetch = store.getState().fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
+    await Promise.resolve()
+    await store.getState().setIssueSourcePreference(repoId, repoPath, 'origin')
+    const secondFetch = store.getState().fetchWorkItems(repoId, repoPath, 20, '', { sourceContext })
+    resolveFirst(emptyEnvelope)
+    await firstFetch
+    await secondFetch
+
+    expect(mockApi.gh.listWorkItems).toHaveBeenCalledTimes(2)
   })
 })
 

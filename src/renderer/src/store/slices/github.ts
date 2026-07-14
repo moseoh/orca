@@ -893,7 +893,12 @@ function repoCacheKeyPrefixes(repoId: string, repoPath?: string): string[] {
 }
 
 function matchesRepoCacheKey(key: string, prefixes: readonly string[]): boolean {
-  return prefixes.some((prefix) => key.startsWith(prefix))
+  // Why: task-source-scoped keys (`github:local:…::repoId::…`) and
+  // execution-host-scoped keys (`hostId::repoId::…`) embed the repo segment
+  // after a `::` join rather than at the start. Matching only bare prefixes
+  // silently skips every scoped entry, so preference flips and repo evictions
+  // leave stale-source data behind.
+  return prefixes.some((prefix) => key.startsWith(prefix) || key.includes(`::${prefix}`))
 }
 
 function clearInflightWorkItemsForRepo(repoId: string, repoPath?: string): void {
@@ -4682,11 +4687,13 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
     // cache keys are repo-scoped, but we also drop legacy path-scoped entries
     // that may have been restored from older persisted cache data.
     set((s) => {
-      const prefix = `${repoId}::`
-      const legacyPrefix = `${repoPath}::`
+      // Why: must use the shared matcher — TaskPage keys carry a task-source
+      // scope prefix, so bare startsWith checks would evict nothing and the
+      // post-flip effect would keep serving the old source's fresh cache.
+      const prefixes = repoCacheKeyPrefixes(repoId, repoPath)
       const next: Record<string, CacheEntry<GitHubWorkItem[]>> = {}
       for (const [key, entry] of Object.entries(s.workItemsCache)) {
-        if (!key.startsWith(prefix) && !key.startsWith(legacyPrefix)) {
+        if (!matchesRepoCacheKey(key, prefixes)) {
           next[key] = entry
         }
       }
