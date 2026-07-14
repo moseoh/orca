@@ -73,8 +73,8 @@ type RateLimitResetCredits = {
 }
 
 type RpcRateLimitsResult = {
-  primary?: RpcRateWindow
-  secondary?: RpcRateWindow
+  primary?: RpcRateWindow | null
+  secondary?: RpcRateWindow | null
 }
 
 // Why: the Codex app-server wraps rate limit data inside a `rateLimits` key.
@@ -454,8 +454,18 @@ export async function consumeCodexRateLimitResetCredit(options: {
   return mapBackendConsumeOutcome(payload.code)
 }
 
+const MAX_SESSION_WINDOW_MINUTES = 1440
+
+function isWeeklyWindowDuration(windowMinutes: number | undefined): boolean {
+  return (
+    typeof windowMinutes === 'number' &&
+    Number.isFinite(windowMinutes) &&
+    windowMinutes > MAX_SESSION_WINDOW_MINUTES
+  )
+}
+
 function mapRpcWindow(
-  raw: RpcRateWindow | undefined,
+  raw: RpcRateWindow | null | undefined,
   expectedWindowMinutes: number
 ): RateLimitWindow | null {
   if (!raw || typeof raw.usedPercent !== 'number' || !Number.isFinite(raw.usedPercent)) {
@@ -483,27 +493,54 @@ function mapRpcWindow(
 
   return {
     usedPercent: Math.min(100, Math.max(0, raw.usedPercent)),
-    // Why: Codex currently reports remaining minutes in `windowDurationMins`.
-    // Orca's UI needs the fixed bucket duration so labels stay "5h" / "wk".
+    // Why: older Codex CLIs report *remaining* minutes in `windowDurationMins`
+    // while newer ones report the bucket duration. Orca's UI needs the fixed
+    // bucket duration so labels stay "5h" / "wk".
     windowMinutes: expectedWindowMinutes,
     resetsAt,
     resetDescription
   }
 }
 
+// Why: plans without a 5h bucket report the weekly limit as *primary*. Windows
+// longer than a day are always weekly; shorter ones keep slot order because
+// older CLIs report *remaining* minutes in the duration field.
+function classifyCodexWindows<T>(
+  primary: T | null | undefined,
+  secondary: T | null | undefined,
+  durationMinutesOf: (window: T | null | undefined) => number | undefined,
+  map: (window: T | null | undefined, expectedWindowMinutes: number) => RateLimitWindow | null
+): { session: RateLimitWindow | null; weekly: RateLimitWindow | null } {
+  if (isWeeklyWindowDuration(durationMinutesOf(primary))) {
+    return {
+      session: isWeeklyWindowDuration(durationMinutesOf(secondary)) ? null : map(secondary, 300),
+      weekly: map(primary, 10080)
+    }
+  }
+  return {
+    session: map(primary, 300),
+    weekly: map(secondary, 10080)
+  }
+}
+
+function backendWindowDurationMinutes(
+  raw: BackendRateLimitWindow | null | undefined
+): number | undefined {
+  const limitWindowSeconds = raw?.limit_window_seconds
+  // Match Codex backend-client's `window_minutes_from_seconds`: the backend
+  // field is the actual bucket duration and rounds partial minutes upward.
+  return typeof limitWindowSeconds === 'number' &&
+    Number.isFinite(limitWindowSeconds) &&
+    limitWindowSeconds > 0
+    ? Math.ceil(limitWindowSeconds / 60)
+    : undefined
+}
+
 function mapBackendUsageWindow(
   raw: BackendRateLimitWindow | null | undefined,
   fallbackWindowMinutes: number
 ): RateLimitWindow | null {
-  const limitWindowSeconds = raw?.limit_window_seconds
-  // Match Codex backend-client's `window_minutes_from_seconds`: the backend
-  // field is the actual bucket duration and rounds partial minutes upward.
-  const windowMinutes =
-    typeof limitWindowSeconds === 'number' &&
-    Number.isFinite(limitWindowSeconds) &&
-    limitWindowSeconds > 0
-      ? Math.ceil(limitWindowSeconds / 60)
-      : fallbackWindowMinutes
+  const windowMinutes = backendWindowDurationMinutes(raw) ?? fallbackWindowMinutes
   return mapRpcWindow(
     raw
       ? {
@@ -542,8 +579,12 @@ async function fetchViaBackend(
   }
   return {
     provider: 'codex',
-    session: mapBackendUsageWindow(payload.rate_limit?.primary_window, 300),
-    weekly: mapBackendUsageWindow(payload.rate_limit?.secondary_window, 10080),
+    ...classifyCodexWindows(
+      payload.rate_limit?.primary_window,
+      payload.rate_limit?.secondary_window,
+      backendWindowDurationMinutes,
+      mapBackendUsageWindow
+    ),
     ...(payload.rate_limit_reset_credits !== undefined
       ? {
           rateLimitResetCredits:
@@ -724,8 +765,12 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
 
             const wrapper = msg.result as RpcRateLimitsResponse | undefined
             const result = wrapper?.rateLimits
-            const session = mapRpcWindow(result?.primary, 300)
-            const weekly = mapRpcWindow(result?.secondary, 10080)
+            const { session, weekly } = classifyCodexWindows(
+              result?.primary,
+              result?.secondary,
+              (window) => window?.windowDurationMins,
+              mapRpcWindow
+            )
             const rateLimitResetCredits = mapRpcRateLimitResetCredits(
               wrapper?.rateLimitResetCredits
             )
@@ -827,10 +872,12 @@ function parsePtyStatus(output: string): {
       }
     : null
 
-  // Try to extract reset time from surrounding text
+  // Try to extract reset time from surrounding text. Weekly-only plans have
+  // no session window, so fall back to the weekly one instead of dropping it.
   const resetMatch = RESET_TEXT_RE.exec(output)
-  if (resetMatch && session) {
-    session.resetDescription = resetMatch[1].trim()
+  const resetTarget = session ?? weekly
+  if (resetMatch && resetTarget) {
+    resetTarget.resetDescription = resetMatch[1].trim()
   }
 
   return { session, weekly }

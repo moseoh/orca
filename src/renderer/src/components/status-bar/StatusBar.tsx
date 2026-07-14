@@ -1221,7 +1221,11 @@ function ProviderSegment({
   return (
     <span className="inline-flex items-center gap-1.5">
       <ProviderIcon provider={provider} />
-      {p.session && !compact && <MiniBar usedPct={clampUsedPercent(p.session.usedPercent)} />}
+      {/* Why: plans without a session bucket (e.g. Codex Pro) only report a
+          weekly window; fall back to the first window so the gauge stays. */}
+      {visibleWindows[0] && !compact && (
+        <MiniBar usedPct={clampUsedPercent(visibleWindows[0].window.usedPercent)} />
+      )}
       {visibleWindows.map((window, index) => (
         <React.Fragment key={window.key}>
           {index > 0 && <span className="text-muted-foreground">·</span>}

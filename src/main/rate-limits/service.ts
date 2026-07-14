@@ -351,7 +351,9 @@ export class RateLimitService {
     const nextTarget = normalizeCodexAccountSelectionTarget(target)
     if (
       outgoingAccountId &&
-      this.state.codex?.session &&
+      // Why: plans without a session bucket report weekly-only limits; those
+      // snapshots are still worth caching for the inactive-account view.
+      (this.state.codex?.session || this.state.codex?.weekly) &&
       this.isSameCodexTarget(this.codexFetchTarget, nextTarget)
     ) {
       this.inactiveCodexCache.set(outgoingAccountId, this.state.codex)

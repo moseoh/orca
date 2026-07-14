@@ -368,6 +368,57 @@ describe('fetchCodexRateLimits', () => {
     expect(result.weekly?.windowMinutes).toBe(10080)
   })
 
+  it('classifies a weekly-duration primary window as weekly when no session window exists', async () => {
+    const rpcChild = makeRpcChild()
+    childSpawnMock.mockReturnValue(rpcChild)
+    rpcChild.stdin.write.mockImplementation((line: string) => {
+      const msg = JSON.parse(line) as { id?: number; method?: string }
+      if (msg.method === 'initialize') {
+        setTimeout(() => {
+          rpcChild.stdout.emit(
+            'data',
+            Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} })}\n`)
+          )
+        }, 0)
+      }
+      if (msg.method === 'account/rateLimits/read') {
+        setTimeout(() => {
+          rpcChild.stdout.emit(
+            'data',
+            Buffer.from(
+              `${JSON.stringify({
+                jsonrpc: '2.0',
+                id: msg.id,
+                result: {
+                  rateLimits: {
+                    primary: {
+                      usedPercent: 72,
+                      windowDurationMins: 10080,
+                      resetsAt: 1_784_503_944
+                    },
+                    secondary: null
+                  }
+                }
+              })}\n`
+            )
+          )
+        }, 0)
+      }
+    })
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await resultPromise
+
+    expect(result.session).toBeNull()
+    expect(result.weekly).toMatchObject({
+      usedPercent: 72,
+      windowMinutes: 10080,
+      resetsAt: 1_784_503_944_000
+    })
+  })
+
   it('fills reset-credit count from the backend when the installed app-server omits it', async () => {
     const rpcChild = makeRpcChild()
     childSpawnMock.mockReturnValue(rpcChild)
