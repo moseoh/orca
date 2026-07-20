@@ -9667,6 +9667,7 @@
             "hugeRepoIgnorePrompt": "この repos にはアクティブな変更が多すぎます。「{{value0}}」を .gitignore に追加しますか？",
             "hugeRepoIgnoreAction": ".gitignore に追加",
             "tooManyChanges": "検出された変更が多すぎます。最初の {{value0}} 件のみ表示しています。",
+            "submoduleTruncated": "その他のサブモジュールの変更は省略されました",
             "bf5082de46": "{{value0}}をコピーしました",
             "c06193ef57": "{{value0}}をコピーできませんでした",
             "d172a4f068": "Commit ハッシュ",
@@ -9722,7 +9723,8 @@
               "a9bf7c171a": "プッシュ失敗",
               "834cb3f23d": "AIで修正",
               "783a808870": "閉じる"
-            }
+            },
+            "97e7124eac": "Source Control を更新できませんでした。もう一度お試しください。"
           },
           "SourceControlAgentActionDialog": {
             "8e856842d1": "選択した agent を開始できませんでした。",
