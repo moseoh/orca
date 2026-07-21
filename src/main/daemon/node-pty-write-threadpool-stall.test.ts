@@ -145,6 +145,7 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
     syncWriteData: () => string[]
     zeroReturnTurns: number[]
     pendingCallbacks: ((err: NodeJS.ErrnoException | null, written: number) => void)[]
+    probeDones: (() => void)[]
     releaseEagain: () => void
     restore: () => void
   }
@@ -156,7 +157,7 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
   function createHarness(opts?: {
     eagainSyncWrites?: number
     zeroSyncWrites?: number
-    canary?: 'stalled' | 'alive'
+    canary?: 'stalled' | 'alive' | 'manual'
   }): WriteHarness {
     const CustomWriteStream = loadCustomWriteStream()
     const originalTimeout = CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS
@@ -165,10 +166,15 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
     CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS = 50
     CustomWriteStream.CANARY_TIMEOUT_MS = 30
     // Default to a wedged pool: the canary probe never completes. 'alive'
-    // simulates a healthy pool whose one completion is merely late.
+    // simulates a healthy pool whose one completion is merely late; 'manual'
+    // hands each probe's completion to the test for race orchestration.
+    const probeDones: (() => void)[] = []
     CustomWriteStream.probeThreadpool = (done: () => void) => {
-      if ((opts?.canary ?? 'stalled') === 'alive') {
+      const mode = opts?.canary ?? 'stalled'
+      if (mode === 'alive') {
         setTimeout(done, 5)
+      } else if (mode === 'manual') {
+        probeDones.push(done)
       }
     }
 
@@ -203,9 +209,14 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
       return undefined
     }) as typeof fs.write
 
-    cjsFs.writeSync = ((fd: number, buffer: Buffer, offset?: number) => {
+    cjsFs.writeSync = ((fd: number, buffer: Buffer, offset?: number, length?: number) => {
       if (fd !== FAKE_FD) {
-        return (realWriteSync as unknown as (...args: unknown[]) => number)(fd, buffer, offset)
+        return (realWriteSync as unknown as (...args: unknown[]) => number)(
+          fd,
+          buffer,
+          offset,
+          length
+        )
       }
       if (remainingEagain > 0) {
         remainingEagain--
@@ -218,8 +229,11 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
         zeroReturnTurns.push(turn)
         return 0
       }
-      syncWrites.push({ data: buffer.subarray(offset ?? 0).toString('utf8'), turn })
-      return buffer.byteLength - (offset ?? 0)
+      const start = offset ?? 0
+      const end =
+        length === undefined ? buffer.byteLength : Math.min(start + length, buffer.byteLength)
+      syncWrites.push({ data: buffer.subarray(start, end).toString('utf8'), turn })
+      return end - start
     }) as typeof fs.writeSync
 
     const stream = new CustomWriteStream(FAKE_FD, 'utf8')
@@ -228,6 +242,7 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
       syncWrites,
       syncWriteData: () => syncWrites.map((w) => w.data),
       zeroReturnTurns,
+      probeDones,
       pendingCallbacks,
       releaseEagain: () => {
         remainingEagain = 0
@@ -353,14 +368,104 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
         harness.stream.write('jkl')
         await delay(200)
 
-        // All queued input (minus the abandoned head) must still arrive…
-        expect(harness.syncWriteData()).toEqual(['def', 'ghi', 'jkl'])
+        // All queued input (minus the abandoned head) must still arrive, in
+        // order (tasks may be split by the per-turn byte cap)…
+        expect(harness.syncWriteData().join('')).toBe('defghijkl')
         // …but not all inside a single event-loop turn.
         const turns = new Set(harness.syncWrites.map((w) => w.turn))
         expect(turns.size).toBeGreaterThan(1)
       } finally {
         CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET = originalBudget
       }
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it('ignores a stale canary completion from an earlier write (generation race)', async () => {
+    const harness = createHarness({ canary: 'manual' })
+    try {
+      // Write A stalls long enough for its watchdog to dispatch canary A.
+      harness.stream.write('A')
+      await delay(60)
+      expect(harness.probeDones.length).toBe(1)
+
+      // A's completion arrives before canary A's timer expires; write B then
+      // stalls and dispatches canary B.
+      harness.pendingCallbacks.shift()?.(null, 1)
+      harness.stream.write('B')
+      await delay(60)
+      expect(harness.probeDones.length).toBe(2)
+
+      // The STALE canary-A completion lands while canary B is deciding. It
+      // must not cancel canary B's timer — otherwise write B is stuck forever
+      // with no watchdog and no canary (the exact hang this patch fixes).
+      harness.probeDones[0]?.()
+      await delay(100)
+
+      // Canary B must still have timed out and engaged the fallback: B was
+      // abandoned, and a subsequent write goes through synchronously.
+      harness.stream.write('C')
+      await delay(50)
+      expect(harness.syncWriteData()).toEqual(['C'])
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it('caps each sync writeSync call at the remaining turn budget', async () => {
+    const harness = createHarness()
+    try {
+      const CustomWriteStream = loadCustomWriteStream()
+      const originalBudget = CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET
+      CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET = 4
+      try {
+        harness.stream.write('x')
+        harness.stream.write('abcdefghij')
+        await delay(200)
+
+        // The 10-byte task must arrive in full…
+        expect(harness.syncWriteData().join('')).toBe('abcdefghij')
+        // …but no single event-loop turn may exceed the byte budget — a
+        // single large task must not bypass it in one syscall.
+        const perTurn = new Map<number, number>()
+        for (const w of harness.syncWrites) {
+          perTurn.set(w.turn, (perTurn.get(w.turn) ?? 0) + w.data.length)
+        }
+        for (const bytes of perTurn.values()) {
+          expect(bytes).toBeLessThanOrEqual(4)
+        }
+      } finally {
+        CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET = originalBudget
+      }
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it('defers the wedge verdict when the event loop itself was stalled', async () => {
+    const harness = createHarness()
+    try {
+      harness.stream.write('x')
+      harness.stream.write('y')
+      // Let the watchdog fire and the canary timer arm…
+      await delay(60)
+      // …then stall the event loop synchronously past the canary deadline.
+      // When the loop resumes, the canary timer fires hugely late — that
+      // lateness proves the loop (not necessarily the pool) was stalled, so
+      // the verdict must be deferred to a fresh probe cycle.
+      const blockUntil = Date.now() + 150
+      while (Date.now() < blockUntil) {
+        // busy-wait to stall the loop
+      }
+      // Yield once so the overdue canary timer gets to run its callback.
+      await delay(10)
+      expect(harness.syncWriteData()).toEqual([])
+
+      // The pool really is wedged here (probe never completes), so a fresh
+      // undisturbed probe cycle must still reach the fallback.
+      await delay(300)
+      expect(harness.syncWriteData()).toEqual(['y'])
     } finally {
       harness.restore()
     }
