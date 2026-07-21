@@ -76,7 +76,7 @@ index 8c4fca9022a6d6f015bca87f61625cde2278f428..0a01730616488119aa21ef441cf3c441
  //# sourceMappingURL=conpty_console_list_agent.js.map
 \ No newline at end of file
 diff --git a/lib/unixTerminal.js b/lib/unixTerminal.js
-index 1ec12f796a822c78fba9ad7f6448c3987e325c23..9de09172a606338e816389012c716508cf6fc259 100644
+index 1ec12f796a822c78fba9ad7f6448c3987e325c23..296fc556aa55d6a917abd35a6a9e40908572dc00 100644
 --- a/lib/unixTerminal.js
 +++ b/lib/unixTerminal.js
 @@ -28,8 +28,12 @@ var native = utils_1.loadNativeModule('pty');
@@ -94,7 +94,7 @@ index 1ec12f796a822c78fba9ad7f6448c3987e325c23..9de09172a606338e816389012c716508
  var DEFAULT_FILE = 'sh';
  var DEFAULT_NAME = 'xterm';
  var DESTROY_SOCKET_TIMEOUT_MS = 200;
-@@ -283,10 +287,15 @@ var CustomWriteStream = /** @class */ (function () {
+@@ -283,10 +287,19 @@ var CustomWriteStream = /** @class */ (function () {
          this._fd = _fd;
          this._encoding = _encoding;
          this._writeQueue = [];
@@ -105,12 +105,16 @@ index 1ec12f796a822c78fba9ad7f6448c3987e325c23..9de09172a606338e816389012c716508
          this._writeImmediate = undefined;
 +        clearTimeout(this._callbackWatchdog);
 +        this._callbackWatchdog = undefined;
++        clearTimeout(this._canaryTimer);
++        this._canaryTimer = undefined;
 +        clearTimeout(this._syncRetryTimer);
 +        this._syncRetryTimer = undefined;
++        clearImmediate(this._drainImmediate);
++        this._drainImmediate = undefined;
      };
      CustomWriteStream.prototype.write = function (data) {
          // Writes are put in a queue and processed asynchronously in order to handle
-@@ -296,7 +305,10 @@ var CustomWriteStream = /** @class */ (function () {
+@@ -296,7 +309,10 @@ var CustomWriteStream = /** @class */ (function () {
              : Buffer.from(data);
          if (buffer.byteLength !== 0) {
              this._writeQueue.push({ buffer: buffer, offset: 0 });
@@ -122,7 +126,7 @@ index 1ec12f796a822c78fba9ad7f6448c3987e325c23..9de09172a606338e816389012c716508
                  this._processWriteQueue();
              }
          }
-@@ -308,10 +320,26 @@ var CustomWriteStream = /** @class */ (function () {
+@@ -308,10 +324,28 @@ var CustomWriteStream = /** @class */ (function () {
              return;
          }
          var task = this._writeQueue[0];
@@ -133,16 +137,18 @@ index 1ec12f796a822c78fba9ad7f6448c3987e325c23..9de09172a606338e816389012c716508
 +        // completions stop being delivered — observed in Electron utility
 +        // processes), the callback below never fires, the queue head never
 +        // advances, and every subsequent write is queued forever with no error.
-+        // The watchdog detects a callback that never arrives and switches this
-+        // stream to synchronous writes, which bypass the threadpool.
-+        clearTimeout(this._callbackWatchdog);
-+        this._callbackWatchdog = setTimeout(function () {
-+            _this._callbackWatchdog = undefined;
-+            _this._enterSyncFallback(task);
-+        }, CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS);
++        // The watchdog detects a callback that never arrives; a canary probe
++        // then confirms the pool is actually dead (a paused event loop or a
++        // merely-busy pool completes the canary and no fallback happens) before
++        // switching this stream to synchronous writes, which bypass the pool.
++        this._armWriteWatchdog(task);
          fs.write(this._fd, task.buffer, task.offset, function (err, written) {
 +            clearTimeout(_this._callbackWatchdog);
 +            _this._callbackWatchdog = undefined;
++            // The write completed, so the pool is alive: cancel any in-flight
++            // canary decision that would have abandoned this task.
++            clearTimeout(_this._canaryTimer);
++            _this._canaryTimer = undefined;
 +            if (_this._syncFallback) {
 +                // Late completion of the write the watchdog gave up on. The task
 +                // was abandoned when the fallback engaged; processing it here
@@ -152,31 +158,78 @@ index 1ec12f796a822c78fba9ad7f6448c3987e325c23..9de09172a606338e816389012c716508
              if (err) {
                  if ('code' in err && err.code === 'EAGAIN') {
                      // `setImmediate` is used to yield to the event loop and re-attempt
-@@ -341,6 +369,54 @@ var CustomWriteStream = /** @class */ (function () {
+@@ -341,6 +375,120 @@ var CustomWriteStream = /** @class */ (function () {
              _this._processWriteQueue();
          });
      };
++    CustomWriteStream.prototype._armWriteWatchdog = function (task) {
++        var _this = this;
++        clearTimeout(this._callbackWatchdog);
++        this._callbackWatchdog = setTimeout(function () {
++            _this._callbackWatchdog = undefined;
++            _this._startCanaryProbe(task);
++        }, CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS);
++    };
++    CustomWriteStream.prototype._startCanaryProbe = function (stalledTask) {
++        var _this = this;
++        if (this._syncFallback || this._canaryTimer !== undefined) {
++            return;
++        }
++        // A slow write completion alone cannot distinguish a wedged pool from a
++        // paused event loop (GC, suspend/resume) or a busy-but-alive pool. Probe
++        // with an independent threadpool op: if the probe completes, keep
++        // waiting; only a probe that also never returns confirms the wedge.
++        this._canaryTimer = setTimeout(function () {
++            _this._canaryTimer = undefined;
++            _this._enterSyncFallback(stalledTask);
++        }, CustomWriteStream.CANARY_TIMEOUT_MS);
++        CustomWriteStream.probeThreadpool(function () {
++            if (_this._canaryTimer === undefined) {
++                // Decision already made (fallback engaged, the stalled write
++                // completed, or the stream was disposed).
++                return;
++            }
++            clearTimeout(_this._canaryTimer);
++            _this._canaryTimer = undefined;
++            // Pool alive; if the same write is still pending, watch it again.
++            if (!_this._syncFallback && _this._writeQueue[0] === stalledTask) {
++                _this._armWriteWatchdog(stalledTask);
++            }
++        });
++    };
 +    CustomWriteStream.prototype._enterSyncFallback = function (stalledTask) {
 +        this._syncFallback = true;
 +        // Abandon the stalled task rather than re-writing it synchronously: its
 +        // in-flight fs.write may still land if the threadpool recovers, and
 +        // writing the same bytes twice could, e.g., execute a command twice.
++        var droppedBytes = 0;
 +        if (this._writeQueue[0] === stalledTask) {
++            droppedBytes = stalledTask.buffer.byteLength - stalledTask.offset;
 +            this._writeQueue.shift();
 +        }
 +        console.error('node-pty: pty write completion did not arrive within ' +
 +            CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS +
-+            'ms; assuming a wedged threadpool and falling back to synchronous writes');
++            'ms and a canary threadpool probe also stalled; falling back to ' +
++            'synchronous writes (abandoning ' + droppedBytes + ' undeliverable byte(s))');
 +        this._drainQueueSync();
 +    };
 +    CustomWriteStream.prototype._drainQueueSync = function () {
 +        var _this = this;
-+        if (this._syncRetryTimer !== undefined) {
-+            // An EAGAIN retry is already scheduled; it will drain the queue (and
-+            // anything appended meanwhile) in order.
++        if (this._syncRetryTimer !== undefined || this._drainImmediate !== undefined) {
++            // A retry or continuation is already scheduled; it will drain the
++            // queue (and anything appended meanwhile) in order.
 +            return;
 +        }
++        var bytesThisTurn = 0;
 +        while (this._writeQueue.length > 0) {
++            if (bytesThisTurn >= CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET) {
++                // Yield so a large backlog cannot monopolize the event loop.
++                this._drainImmediate = setImmediate(function () {
++                    _this._drainImmediate = undefined;
++                    _this._drainQueueSync();
++                });
++                return;
++            }
 +            var task = this._writeQueue[0];
 +            var written = void 0;
 +            try {
@@ -184,25 +237,44 @@ index 1ec12f796a822c78fba9ad7f6448c3987e325c23..9de09172a606338e816389012c716508
 +            }
 +            catch (err) {
 +                if (err && err.code === 'EAGAIN') {
-+                    this._syncRetryTimer = setTimeout(function () {
-+                        _this._syncRetryTimer = undefined;
-+                        _this._drainQueueSync();
-+                    }, 5);
++                    this._scheduleSyncRetry();
 +                    return;
 +                }
 +                this._writeQueue.length = 0;
 +                console.error('Unhandled pty write error', err);
 +                return;
 +            }
++            if (written === 0) {
++                // Defensive: treat a zero-byte write like backpressure instead of
++                // spinning on the same task in a tight loop.
++                this._scheduleSyncRetry();
++                return;
++            }
 +            task.offset += written;
++            bytesThisTurn += written;
 +            if (task.offset >= task.buffer.byteLength) {
 +                this._writeQueue.shift();
 +            }
 +        }
 +    };
-+    // How long to wait for an fs.write completion before concluding the
-+    // threadpool is wedged. Static so embedders/tests can tune it.
++    CustomWriteStream.prototype._scheduleSyncRetry = function () {
++        var _this = this;
++        this._syncRetryTimer = setTimeout(function () {
++            _this._syncRetryTimer = undefined;
++            _this._drainQueueSync();
++        }, 5);
++    };
++    // How long to wait for an fs.write completion before probing the
++    // threadpool. Static so embedders/tests can tune them.
 +    CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS = 2000;
++    // How long the canary probe may take before the pool counts as wedged.
++    CustomWriteStream.CANARY_TIMEOUT_MS = 2000;
++    // Max bytes written per event-loop turn once in sync-fallback mode.
++    CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET = 65536;
++    // Independent threadpool liveness probe; injectable for tests.
++    CustomWriteStream.probeThreadpool = function (done) {
++        fs.stat('.', function () { done(); });
++    };
      return CustomWriteStream;
  }());
 +exports.CustomWriteStream = CustomWriteStream;

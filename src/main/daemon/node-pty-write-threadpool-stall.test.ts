@@ -25,6 +25,9 @@ type CustomWriteStreamClass = {
     dispose: () => void
   }
   WRITE_CALLBACK_TIMEOUT_MS: number
+  CANARY_TIMEOUT_MS: number
+  SYNC_DRAIN_BYTE_BUDGET: number
+  probeThreadpool: (done: () => void) => void
 }
 
 function loadCustomWriteStream(): CustomWriteStreamClass {
@@ -83,9 +86,12 @@ describeOnUnix('node-pty write threadpool stall fallback', () => {
     // Shrink the fallback wait so the test runs fast
     const CustomWriteStream = loadCustomWriteStream()
     const originalTimeout = CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS
+    const originalCanary = CustomWriteStream.CANARY_TIMEOUT_MS
     CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS = 300
+    CustomWriteStream.CANARY_TIMEOUT_MS = 200
     cleanups.push(() => {
       CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS = originalTimeout
+      CustomWriteStream.CANARY_TIMEOUT_MS = originalCanary
     })
 
     const proc = pty.spawn('/bin/sh', ['-c', 'read line; echo "GOT:$line"'], {
@@ -135,7 +141,9 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
 
   type WriteHarness = {
     stream: InstanceType<CustomWriteStreamClass>
-    syncWrites: string[]
+    syncWrites: { data: string; turn: number }[]
+    syncWriteData: () => string[]
+    zeroReturnTurns: number[]
     pendingCallbacks: ((err: NodeJS.ErrnoException | null, written: number) => void)[]
     releaseEagain: () => void
     restore: () => void
@@ -145,14 +153,42 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
   // driven without a real pty and without touching vitest's own fs usage.
   // Patches the CJS fs exports object (what the node-pty lib captured via
   // require) — the ESM namespace is frozen and cannot be spied.
-  function createHarness(opts?: { eagainSyncWrites?: number }): WriteHarness {
+  function createHarness(opts?: {
+    eagainSyncWrites?: number
+    zeroSyncWrites?: number
+    canary?: 'stalled' | 'alive'
+  }): WriteHarness {
     const CustomWriteStream = loadCustomWriteStream()
     const originalTimeout = CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS
+    const originalCanary = CustomWriteStream.CANARY_TIMEOUT_MS
+    const originalProbe = CustomWriteStream.probeThreadpool
     CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS = 50
+    CustomWriteStream.CANARY_TIMEOUT_MS = 30
+    // Default to a wedged pool: the canary probe never completes. 'alive'
+    // simulates a healthy pool whose one completion is merely late.
+    CustomWriteStream.probeThreadpool = (done: () => void) => {
+      if ((opts?.canary ?? 'stalled') === 'alive') {
+        setTimeout(done, 5)
+      }
+    }
 
-    const syncWrites: string[] = []
+    // Tracks event-loop turns so tests can assert work was split across
+    // setImmediate boundaries (drain budget, zero-write backpressure).
+    let turn = 0
+    let turnTrackerDone = false
+    const tick = (): void => {
+      turn++
+      if (!turnTrackerDone) {
+        setImmediate(tick)
+      }
+    }
+    setImmediate(tick)
+
+    const syncWrites: WriteHarness['syncWrites'] = []
+    const zeroReturnTurns: number[] = []
     const pendingCallbacks: WriteHarness['pendingCallbacks'] = []
     let remainingEagain = opts?.eagainSyncWrites ?? 0
+    let remainingZero = opts?.zeroSyncWrites ?? 0
 
     const cjsFs = createRequire(import.meta.url)('fs') as typeof fs
     const realWrite = cjsFs.write
@@ -177,7 +213,12 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
         err.code = 'EAGAIN'
         throw err
       }
-      syncWrites.push(buffer.subarray(offset ?? 0).toString('utf8'))
+      if (remainingZero > 0) {
+        remainingZero--
+        zeroReturnTurns.push(turn)
+        return 0
+      }
+      syncWrites.push({ data: buffer.subarray(offset ?? 0).toString('utf8'), turn })
       return buffer.byteLength - (offset ?? 0)
     }) as typeof fs.writeSync
 
@@ -185,15 +226,20 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
     return {
       stream,
       syncWrites,
+      syncWriteData: () => syncWrites.map((w) => w.data),
+      zeroReturnTurns,
       pendingCallbacks,
       releaseEagain: () => {
         remainingEagain = 0
       },
       restore: () => {
+        turnTrackerDone = true
         stream.dispose()
         cjsFs.write = realWrite
         cjsFs.writeSync = realWriteSync
         CustomWriteStream.WRITE_CALLBACK_TIMEOUT_MS = originalTimeout
+        CustomWriteStream.CANARY_TIMEOUT_MS = originalCanary
+        CustomWriteStream.probeThreadpool = originalProbe
       }
     }
   }
@@ -208,11 +254,11 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
       // Fallback engaged: 'abc' is abandoned (its in-flight fs.write may still
       // land in the kernel; re-sending it could deliver the bytes twice).
       // 'def' is delivered synchronously.
-      expect(harness.syncWrites).toEqual(['def'])
+      expect(harness.syncWriteData()).toEqual(['def'])
 
       // Later writes keep using the sync path.
       harness.stream.write('ghi')
-      expect(harness.syncWrites).toEqual(['def', 'ghi'])
+      expect(harness.syncWriteData()).toEqual(['def', 'ghi'])
     } finally {
       harness.restore()
     }
@@ -227,7 +273,7 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
 
       // Fallback engaged, but 'def' is still queued: every writeSync hits
       // EAGAIN and the drain is waiting on its retry timer.
-      expect(harness.syncWrites).toEqual([])
+      expect(harness.syncWriteData()).toEqual([])
 
       // The stalled completion finally arrives. Without the guard it would run
       // the async completion logic and shift the queued 'def' out of the queue,
@@ -236,7 +282,7 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
 
       harness.releaseEagain()
       await delay(100)
-      expect(harness.syncWrites).toEqual(['def'])
+      expect(harness.syncWriteData()).toEqual(['def'])
     } finally {
       harness.restore()
     }
@@ -254,7 +300,7 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
       harness.pendingCallbacks.shift()?.(null, 3)
       await delay(50)
 
-      expect(harness.syncWrites).toEqual([])
+      expect(harness.syncWriteData()).toEqual([])
     } finally {
       harness.restore()
     }
@@ -267,7 +313,73 @@ describeOnUnix('CustomWriteStream sync fallback', () => {
       harness.stream.write('def')
       await delay(200)
 
-      expect(harness.syncWrites).toEqual(['def'])
+      expect(harness.syncWriteData()).toEqual(['def'])
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it('does not fall back when the pool is alive and a completion is merely late', async () => {
+    const harness = createHarness({ canary: 'alive' })
+    try {
+      harness.stream.write('abc')
+      // Watchdog fires at 50ms, but the canary probe completes (pool alive),
+      // so the stream must keep waiting instead of abandoning the write.
+      await delay(200)
+      expect(harness.syncWriteData()).toEqual([])
+
+      // The late completion finally lands; the async path resumes as normal.
+      harness.pendingCallbacks.shift()?.(null, 3)
+      harness.stream.write('def')
+      await delay(50)
+
+      expect(harness.syncWriteData()).toEqual([])
+      expect(harness.pendingCallbacks.length).toBe(1)
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it('splits a large sync drain across event-loop turns instead of hogging one', async () => {
+    const harness = createHarness()
+    try {
+      const CustomWriteStream = loadCustomWriteStream()
+      const originalBudget = CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET
+      CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET = 4
+      try {
+        harness.stream.write('abc')
+        harness.stream.write('def')
+        harness.stream.write('ghi')
+        harness.stream.write('jkl')
+        await delay(200)
+
+        // All queued input (minus the abandoned head) must still arrive…
+        expect(harness.syncWriteData()).toEqual(['def', 'ghi', 'jkl'])
+        // …but not all inside a single event-loop turn.
+        const turns = new Set(harness.syncWrites.map((w) => w.turn))
+        expect(turns.size).toBeGreaterThan(1)
+      } finally {
+        CustomWriteStream.SYNC_DRAIN_BYTE_BUDGET = originalBudget
+      }
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it('treats a zero-byte writeSync as backpressure and retries later instead of spinning', async () => {
+    const harness = createHarness({ zeroSyncWrites: 1 })
+    try {
+      harness.stream.write('abc')
+      harness.stream.write('def')
+      await delay(200)
+
+      expect(harness.syncWriteData()).toEqual(['def'])
+      // The retry after the zero-byte write must happen in a later turn —
+      // a tight same-turn loop would spin the event loop on backpressure.
+      const firstWrite = harness.syncWrites.at(0)
+      expect(firstWrite).toBeDefined()
+      expect(harness.zeroReturnTurns.length).toBe(1)
+      expect(firstWrite!.turn).toBeGreaterThan(harness.zeroReturnTurns[0]!)
     } finally {
       harness.restore()
     }
