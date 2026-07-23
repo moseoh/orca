@@ -34,6 +34,12 @@ import {
 const RPC_TIMEOUT_MS = 10_000
 const WSL_RPC_TIMEOUT_MS = 25_000
 const PTY_TIMEOUT_MS = 15_000
+// Why: codex ≥0.145 renders a '›' composer with placeholder text after it, so a
+// prompt-anchored send can never fire; nudge /status after a short boot grace.
+const PTY_STATUS_NUDGE_MS = 2_500
+// Why: '/status\r' in one write coalesces into a paste-like chunk and the TUI
+// inserts the newline instead of submitting; Enter must be its own keypress.
+const PTY_STATUS_ENTER_DELAY_MS = 350
 const BACKEND_TIMEOUT_MS = 10_000
 // Why: redeeming a reset credit is an explicit user action, not a background
 // poll — give it more room before failing so a slow backend can still finish.
@@ -797,13 +803,20 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
 // PTY fallback — spawn `codex`, send `/status`, parse rendered output
 // ---------------------------------------------------------------------------
 
-// Why: these patterns match the Codex CLI's /status output format.
-// "5h limit" and "Weekly limit" lines contain a percent and optional reset text.
-const FIVE_HOUR_RE = /5h\s+limit[:\s]*(\d+)%/i
-const WEEKLY_RE = /weekly\s+limit[:\s]*(\d+)%/i
+// Why: match the Codex CLI /status output ("5h limit"/"Weekly limit" lines). Newer
+// CLIs render a meter between the label and the percent ("Weekly limit: [███░] 43% left"),
+// so skip any non-digit run and capture the used/left word to orient the number.
+const FIVE_HOUR_RE = /5h\s+limit[^\d%\r\n]*(\d+)%(?:\s*(used|left))?/i
+const WEEKLY_RE = /weekly\s+limit[^\d%\r\n]*(\d+)%(?:\s*(used|left))?/i
 
 function isPtyLimitLabel(line: string): boolean {
   return FIVE_HOUR_RE.test(line) || WEEKLY_RE.test(line)
+}
+
+function ptyUsedPercent(match: RegExpExecArray): number {
+  const pct = Number.parseInt(match[1], 10)
+  const oriented = match[2]?.toLowerCase() === 'left' ? 100 - pct : pct
+  return Math.min(100, Math.max(0, oriented))
 }
 
 function parsePtyStatus(output: string): {
@@ -828,7 +841,7 @@ function parsePtyStatus(output: string): {
 
   const session: RateLimitWindow | null = fiveMatch
     ? {
-        usedPercent: Math.min(100, Number.parseInt(fiveMatch[1], 10)),
+        usedPercent: ptyUsedPercent(fiveMatch),
         windowMinutes: 300,
         resetsAt: sessionReset.resetsAt,
         resetDescription: sessionReset.resetDescription
@@ -837,7 +850,7 @@ function parsePtyStatus(output: string): {
 
   const weekly: RateLimitWindow | null = weeklyMatch
     ? {
-        usedPercent: Math.min(100, Number.parseInt(weeklyMatch[1], 10)),
+        usedPercent: ptyUsedPercent(weeklyMatch),
         windowMinutes: 10080,
         resetsAt: weeklyReset.resetsAt,
         resetDescription: weeklyReset.resetDescription
@@ -888,6 +901,39 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
       }
     })
     const termDisposables: { dispose: () => void }[] = [registerHiddenRateLimitPty(term)]
+
+    let statusEnter: ReturnType<typeof setTimeout> | null = null
+    function sendStatusCommand(): void {
+      sentStatus = true
+      if (statusNudge) {
+        clearTimeout(statusNudge)
+        statusNudge = null
+      }
+      term.write('/status')
+      statusEnter = setTimeout(() => {
+        statusEnter = null
+        term.write('\r')
+      }, PTY_STATUS_ENTER_DELAY_MS)
+    }
+
+    let statusNudge: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      statusNudge = null
+      if (!resolved && !sentStatus) {
+        sendStatusCommand()
+      }
+    }, PTY_STATUS_NUDGE_MS)
+    termDisposables.push({
+      dispose: () => {
+        if (statusNudge) {
+          clearTimeout(statusNudge)
+          statusNudge = null
+        }
+        if (statusEnter) {
+          clearTimeout(statusEnter)
+          statusEnter = null
+        }
+      }
+    })
 
     function settleAborted(): void {
       if (resolved) {
@@ -945,9 +991,8 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
       }
 
       // Wait for prompt, then send /status
-      if (!sentStatus && />\s*$/.test(data)) {
-        sentStatus = true
-        term.write('/status\r')
+      if (!sentStatus && /[>›]\s*$/.test(data)) {
+        sendStatusCommand()
         return
       }
 
