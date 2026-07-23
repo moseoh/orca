@@ -11,6 +11,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { probeCodexAuthPresence } from './codex-auth-presence'
+import { extractClaudePtyResetMetadata } from './claude-pty-reset-parser'
 import { resolveCodexCommand } from '../codex-cli/command'
 import { withMacTailscaleDnsHint } from '../network/macos-tailscale-dns-diagnostic'
 import { getCmdExePath, getSpawnArgsForWindows } from '../win32-utils'
@@ -800,7 +801,10 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
 // "5h limit" and "Weekly limit" lines contain a percent and optional reset text.
 const FIVE_HOUR_RE = /5h\s+limit[:\s]*(\d+)%/i
 const WEEKLY_RE = /weekly\s+limit[:\s]*(\d+)%/i
-const RESET_TEXT_RE = /resets?\s+(?:at\s+|in\s+)?(.+)/i
+
+function isPtyLimitLabel(line: string): boolean {
+  return FIVE_HOUR_RE.test(line) || WEEKLY_RE.test(line)
+}
 
 function parsePtyStatus(output: string): {
   session: RateLimitWindow | null
@@ -808,13 +812,26 @@ function parsePtyStatus(output: string): {
 } {
   const fiveMatch = FIVE_HOUR_RE.exec(output)
   const weeklyMatch = WEEKLY_RE.exec(output)
+  const lines = output.split(/\r\n|\n|\r/)
+  // Why: each limit line owns the reset text that follows it (weekly-only plans
+  // have no 5h line), and parsing it into resetsAt is what the UI renders.
+  const sessionReset = extractClaudePtyResetMetadata(
+    lines,
+    (line) => FIVE_HOUR_RE.test(line),
+    isPtyLimitLabel
+  )
+  const weeklyReset = extractClaudePtyResetMetadata(
+    lines,
+    (line) => WEEKLY_RE.test(line),
+    isPtyLimitLabel
+  )
 
   const session: RateLimitWindow | null = fiveMatch
     ? {
         usedPercent: Math.min(100, Number.parseInt(fiveMatch[1], 10)),
         windowMinutes: 300,
-        resetsAt: null,
-        resetDescription: null
+        resetsAt: sessionReset.resetsAt,
+        resetDescription: sessionReset.resetDescription
       }
     : null
 
@@ -822,18 +839,10 @@ function parsePtyStatus(output: string): {
     ? {
         usedPercent: Math.min(100, Number.parseInt(weeklyMatch[1], 10)),
         windowMinutes: 10080,
-        resetsAt: null,
-        resetDescription: null
+        resetsAt: weeklyReset.resetsAt,
+        resetDescription: weeklyReset.resetDescription
       }
     : null
-
-  // Try to extract reset time from surrounding text. Weekly-only plans have
-  // no session window, so fall back to the weekly one instead of dropping it.
-  const resetMatch = RESET_TEXT_RE.exec(output)
-  const resetTarget = session ?? weekly
-  if (resetMatch && resetTarget) {
-    resetTarget.resetDescription = resetMatch[1].trim()
-  }
 
   return { session, weekly }
 }

@@ -106,9 +106,58 @@ describe('fetchCodexRateLimits PTY settle timers', () => {
 
     await vi.advanceTimersByTimeAsync(500)
 
+    const fiveDays23h = (5 * 24 + 23) * 60 * 60 * 1000
     await expect(resultPromise).resolves.toMatchObject({
       session: null,
-      weekly: { usedPercent: 76, resetDescription: '5d 23h' },
+      weekly: {
+        usedPercent: 76,
+        resetDescription: '5d 23h',
+        resetsAt: Date.now() + fiveDays23h
+      },
+      status: 'ok'
+    })
+  })
+
+  it('keeps each window reset text on its own window for dual-window plans', async () => {
+    const ptyHandlers: { onData?: (data: string) => void } = {}
+
+    childSpawnMock.mockImplementation(() => {
+      throw new Error('rpc unavailable')
+    })
+    ptySpawnMock.mockReturnValue({
+      onData: vi.fn((callback) => {
+        ptyHandlers.onData = callback
+        return makeDisposable()
+      }),
+      onExit: vi.fn(() => makeDisposable()),
+      write: vi.fn(),
+      kill: vi.fn()
+    })
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const onPtyData = ptyHandlers.onData
+    if (!onPtyData) {
+      throw new Error('PTY data handler was not registered')
+    }
+
+    onPtyData('>')
+    onPtyData('5h limit: 17% (resets in 2h 30m)\nWeekly limit: 23% (resets in 5d 3h)\n')
+
+    await vi.advanceTimersByTimeAsync(500)
+
+    await expect(resultPromise).resolves.toMatchObject({
+      session: {
+        usedPercent: 17,
+        resetDescription: '2h 30m',
+        resetsAt: Date.now() + (2 * 60 + 30) * 60 * 1000
+      },
+      weekly: {
+        usedPercent: 23,
+        resetDescription: '5d 3h',
+        resetsAt: Date.now() + (5 * 24 + 3) * 60 * 60 * 1000
+      },
       status: 'ok'
     })
   })
