@@ -198,7 +198,7 @@ describe('fetchCodexRateLimits PTY settle timers', () => {
     expect(write).toHaveBeenCalledWith('\r')
 
     onPtyData(
-      '│  Weekly limit:                       [█████████░░░░░░░░░░░] 43% left (resets 10:21 on 28 Jul)  │\n' +
+      '│  Weekly limit:                       \x1b[?2026h\x1b[0 q[█████████░░░░░░░░░░░] 43% left\x1b[?2026l (resets 10:21 on 28 Jul)  │\n' +
         '│  GPT-5.3-Codex-Spark Weekly limit:   [████████████████████] 100% left (resets 17:40 on 29 Jul) │\n'
     )
     await vi.advanceTimersByTimeAsync(500)

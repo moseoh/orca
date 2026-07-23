@@ -818,7 +818,7 @@ const WEEKLY_RE = /(?<![\w-][^\S\r\n]{0,4})weekly\s+limit[^\d%\r\n]*(\d+)%(?:\s*
 const ANY_LIMIT_LABEL_RE = /(?:5h|weekly)\s+limit/i
 
 // eslint-disable-next-line no-control-regex
-const PTY_CONTROL_SEQUENCE_RE = /\x1b\[[0-9;]*[a-zA-Z]/g
+const PTY_CONTROL_SEQUENCE_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g
 
 function stripPtyControlSequences(output: string): string {
   return output.replace(PTY_CONTROL_SEQUENCE_RE, '')
