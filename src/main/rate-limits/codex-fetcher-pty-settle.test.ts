@@ -217,4 +217,84 @@ describe('fetchCodexRateLimits PTY settle timers', () => {
       status: 'ok'
     })
   })
+
+  it('never selects a model-scoped weekly row even when it renders first', async () => {
+    const ptyHandlers: { onData?: (data: string) => void } = {}
+
+    childSpawnMock.mockImplementation(() => {
+      throw new Error('rpc unavailable')
+    })
+    ptySpawnMock.mockReturnValue({
+      onData: vi.fn((callback) => {
+        ptyHandlers.onData = callback
+        return makeDisposable()
+      }),
+      onExit: vi.fn(() => makeDisposable()),
+      write: vi.fn(),
+      kill: vi.fn()
+    })
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const onPtyData = ptyHandlers.onData
+    if (!onPtyData) {
+      throw new Error('PTY data handler was not registered')
+    }
+
+    onPtyData('>')
+    onPtyData(
+      '│  GPT-5.3-Codex-Spark Weekly limit:   [████████████████████] 100% left (resets 17:40 on 29 Jul) │\n' +
+        '│  Weekly limit:                       [█████████░░░░░░░░░░░] 43% left (resets 10:21 on 28 Jul)  │\n'
+    )
+    await vi.advanceTimersByTimeAsync(500)
+
+    await expect(resultPromise).resolves.toMatchObject({
+      session: null,
+      weekly: { usedPercent: 57, resetDescription: '10:21 on 28 Jul' },
+      status: 'ok'
+    })
+  })
+
+  it('re-sends Enter once when the panel does not render after the first submit', async () => {
+    const ptyHandlers: { onData?: (data: string) => void } = {}
+    const write = vi.fn()
+
+    childSpawnMock.mockImplementation(() => {
+      throw new Error('rpc unavailable')
+    })
+    ptySpawnMock.mockReturnValue({
+      onData: vi.fn((callback) => {
+        ptyHandlers.onData = callback
+        return makeDisposable()
+      }),
+      onExit: vi.fn(() => makeDisposable()),
+      write,
+      kill: vi.fn()
+    })
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const onPtyData = ptyHandlers.onData
+    if (!onPtyData) {
+      throw new Error('PTY data handler was not registered')
+    }
+
+    onPtyData('>')
+    await vi.advanceTimersByTimeAsync(350)
+    expect(write.mock.calls.filter((call) => call[0] === '\r')).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(write.mock.calls.filter((call) => call[0] === '\r')).toHaveLength(2)
+
+    onPtyData('Weekly limit: 76%\nResets in 5d 23h\n')
+    await vi.advanceTimersByTimeAsync(500)
+
+    await expect(resultPromise).resolves.toMatchObject({
+      session: null,
+      weekly: { usedPercent: 76 },
+      status: 'ok'
+    })
+  })
 })

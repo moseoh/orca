@@ -40,6 +40,9 @@ const PTY_STATUS_NUDGE_MS = 2_500
 // Why: '/status\r' in one write coalesces into a paste-like chunk and the TUI
 // inserts the newline instead of submitting; Enter must be its own keypress.
 const PTY_STATUS_ENTER_DELAY_MS = 350
+// Why: slow hosts (WSL/SSH) can drop the first Enter while the TUI is still
+// booting; one spare Enter is a no-op on an empty, ready composer.
+const PTY_STATUS_ENTER_RETRY_MS = 3_000
 const BACKEND_TIMEOUT_MS = 10_000
 // Why: redeeming a reset credit is an explicit user action, not a background
 // poll — give it more room before failing so a slow backend can still finish.
@@ -806,11 +809,23 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
 // Why: match the Codex CLI /status output ("5h limit"/"Weekly limit" lines). Newer
 // CLIs render a meter between the label and the percent ("Weekly limit: [███░] 43% left"),
 // so skip any non-digit run and capture the used/left word to orient the number.
-const FIVE_HOUR_RE = /5h\s+limit[^\d%\r\n]*(\d+)%(?:\s*(used|left))?/i
-const WEEKLY_RE = /weekly\s+limit[^\d%\r\n]*(\d+)%(?:\s*(used|left))?/i
+// The lookbehind rejects model-scoped rows ("GPT-…-Spark Weekly limit") so they are
+// never selected as the account window regardless of row order; line-start anchoring
+// is unusable here because stripping cursor-move sequences merges visual lines.
+const FIVE_HOUR_RE = /(?<![\w-][^\S\r\n]{0,4})5h\s+limit[^\d%\r\n]*(\d+)%(?:\s*(used|left))?/i
+const WEEKLY_RE = /(?<![\w-][^\S\r\n]{0,4})weekly\s+limit[^\d%\r\n]*(\d+)%(?:\s*(used|left))?/i
+// Why: model-scoped limit rows must still stop a per-window reset-text scan.
+const ANY_LIMIT_LABEL_RE = /(?:5h|weekly)\s+limit/i
+
+// eslint-disable-next-line no-control-regex
+const PTY_CONTROL_SEQUENCE_RE = /\x1b\[[0-9;]*[a-zA-Z]/g
+
+function stripPtyControlSequences(output: string): string {
+  return output.replace(PTY_CONTROL_SEQUENCE_RE, '')
+}
 
 function isPtyLimitLabel(line: string): boolean {
-  return FIVE_HOUR_RE.test(line) || WEEKLY_RE.test(line)
+  return ANY_LIMIT_LABEL_RE.test(line)
 }
 
 function ptyUsedPercent(match: RegExpExecArray): number {
@@ -913,15 +928,29 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
       statusEnter = setTimeout(() => {
         statusEnter = null
         term.write('\r')
+        statusEnter = setTimeout(() => {
+          statusEnter = null
+          if (!resolved && !settleTimer) {
+            term.write('\r')
+          }
+        }, PTY_STATUS_ENTER_RETRY_MS)
       }, PTY_STATUS_ENTER_DELAY_MS)
     }
 
-    let statusNudge: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      statusNudge = null
-      if (!resolved && !sentStatus) {
-        sendStatusCommand()
+    let statusNudge: ReturnType<typeof setTimeout> | null = null
+    // Why: count the nudge grace from first TUI output, not spawn, so slow
+    // WSL/SSH boots get the full window before /status is typed.
+    function armStatusNudge(): void {
+      if (statusNudge || sentStatus || resolved) {
+        return
       }
-    }, PTY_STATUS_NUDGE_MS)
+      statusNudge = setTimeout(() => {
+        statusNudge = null
+        if (!resolved && !sentStatus) {
+          sendStatusCommand()
+        }
+      }, PTY_STATUS_NUDGE_MS)
+    }
     termDisposables.push({
       dispose: () => {
         if (statusNudge) {
@@ -990,6 +1019,8 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
         output = output.slice(-MAX_DIAGNOSTIC_OUTPUT_LENGTH)
       }
 
+      armStatusNudge()
+
       // Wait for prompt, then send /status
       if (!sentStatus && /[>›]\s*$/.test(data)) {
         sendStatusCommand()
@@ -997,9 +1028,10 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
       }
 
       // Check if we have parseable output
-      if (sentStatus && !settleTimer && (FIVE_HOUR_RE.test(output) || WEEKLY_RE.test(output))) {
-        // Why: after status text is parseable the TUI may continue streaming
-        // chunks; one settle timer is enough to let the panel finish flushing.
+      // Why: colored meter bars embed digits inside CSI sequences, so probe cleaned text.
+      const probe = sentStatus && !settleTimer ? stripPtyControlSequences(output) : null
+      if (probe !== null && (FIVE_HOUR_RE.test(probe) || WEEKLY_RE.test(probe))) {
+        // Why: the TUI keeps streaming after status is parseable; one settle timer lets the panel finish flushing.
         settleTimer = setTimeout(() => {
           settleTimer = null
           if (resolved) {
@@ -1012,8 +1044,7 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
           }
           cleanupHiddenRateLimitPty(term, termDisposables, { kill: true })
 
-          // eslint-disable-next-line no-control-regex
-          const clean = output.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+          const clean = stripPtyControlSequences(output)
           const { session, weekly } = parsePtyStatus(clean)
 
           resolve({
@@ -1046,8 +1077,7 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
           clearTimeout(timeout)
           timeout = null
         }
-        // eslint-disable-next-line no-control-regex
-        const clean = output.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+        const clean = stripPtyControlSequences(output)
         const { session, weekly } = parsePtyStatus(clean)
         resolve({
           provider: 'codex',
