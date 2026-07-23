@@ -12,6 +12,7 @@ import {
   resetRemoteRuntimeTerminalMultiplexersForTests,
   type RemoteRuntimeMultiplexedTerminal
 } from './remote-runtime-terminal-multiplexer'
+import { replaceRuntimeEnvironmentRevisions } from './runtime-environment-revision'
 
 // Why: reproduces the silent frame-drop corruption. The server multiplex path
 // drops Output frames when the websocket buffer is over its cap
@@ -105,6 +106,23 @@ class FakeMultiplexServer {
     this.send(TerminalStreamOpcode.Output, encodeTerminalStreamText(text), this.cursorUnits)
   }
 
+  outputSpan(data: string, rawLength: number): void {
+    this.cursorUnits += rawLength
+    this.send(
+      TerminalStreamOpcode.OutputSpan,
+      encodeTerminalStreamJson({ data, rawLength, transformed: true }),
+      this.cursorUnits
+    )
+  }
+
+  malformedOutputSpan(): void {
+    this.send(
+      TerminalStreamOpcode.OutputSpan,
+      encodeTerminalStreamJson({ data: 'framing must not render' }),
+      this.cursorUnits
+    )
+  }
+
   flushHeldManualSnapshot(): void {
     if (this.heldManualRequestId === null) {
       throw new Error('No manual snapshot is held')
@@ -119,12 +137,16 @@ class FakeMultiplexServer {
 describe('remote terminal frame-drop resync', () => {
   const unsubscribe = vi.fn()
   let server: FakeMultiplexServer
+  let subscribe: ReturnType<typeof vi.fn>
+  let subscriptionCallbacks: SubscribeCallbacks
 
   beforeEach(() => {
     vi.clearAllMocks()
     resetRemoteRuntimeTerminalMultiplexersForTests()
+    replaceRuntimeEnvironmentRevisions([])
 
-    const subscribe = vi.fn(async (_args: unknown, callbacks: SubscribeCallbacks) => {
+    subscribe = vi.fn(async (_args: unknown, callbacks: SubscribeCallbacks) => {
+      subscriptionCallbacks = callbacks
       server = new FakeMultiplexServer((bytes) => callbacks.onBinary?.(bytes))
       queueMicrotask(() => callbacks.onResponse({ ok: true, result: { type: 'ready' } }))
       return {
@@ -144,24 +166,29 @@ describe('remote terminal frame-drop resync', () => {
 
   async function subscribeClient(): Promise<{
     data: string[]
+    metas: { seq?: number; rawLength?: number; transformed?: boolean }[]
     snapshots: string[]
     stream: RemoteRuntimeMultiplexedTerminal
   }> {
     const data: string[] = []
+    const metas: { seq?: number; rawLength?: number; transformed?: boolean }[] = []
     const snapshots: string[] = []
     const multiplexer = getRemoteRuntimeTerminalMultiplexer('env-1')
     const stream = await multiplexer.subscribeTerminal({
       terminal: 'terminal-1',
       client: { id: 'desktop-1', type: 'desktop' },
       callbacks: {
-        onData: (chunk) => data.push(chunk),
+        onData: (chunk, meta) => {
+          data.push(chunk)
+          metas.push(meta ?? {})
+        },
         onSnapshot: (chunk) => snapshots.push(chunk)
       }
     })
     // Let the initial snapshot round-trip settle.
     await Promise.resolve()
     await Promise.resolve()
-    return { data, snapshots, stream }
+    return { data, metas, snapshots, stream }
   }
 
   it('detects a dropped Output frame via the seq gap and resyncs', async () => {
@@ -195,6 +222,99 @@ describe('remote terminal frame-drop resync', () => {
 
     expect(data).toEqual(['one', 'two', 'three'])
     expect(snapshots).toEqual(['INITIAL'])
+  })
+
+  it('replaces the stream and subscription CAS after a same-id re-pair', async () => {
+    replaceRuntimeEnvironmentRevisions([{ id: 'env-1', createdAt: 1, pairingRevision: 10 }])
+    const onTransportClose = vi.fn()
+    const firstMultiplexer = getRemoteRuntimeTerminalMultiplexer('env-1')
+    await firstMultiplexer.subscribeTerminal({
+      terminal: 'terminal-1',
+      client: { id: 'desktop-1', type: 'desktop' },
+      callbacks: { onData: vi.fn(), onSnapshot: vi.fn(), onTransportClose }
+    })
+
+    replaceRuntimeEnvironmentRevisions([{ id: 'env-1', createdAt: 1, pairingRevision: 11 }])
+    const secondMultiplexer = getRemoteRuntimeTerminalMultiplexer('env-1')
+    await secondMultiplexer.subscribeTerminal({
+      terminal: 'terminal-2',
+      client: { id: 'desktop-1', type: 'desktop' },
+      callbacks: { onData: vi.fn(), onSnapshot: vi.fn() }
+    })
+
+    expect(secondMultiplexer).not.toBe(firstMultiplexer)
+    expect(onTransportClose).toHaveBeenCalledTimes(1)
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(subscribe.mock.calls.map((call) => call[0])).toEqual([
+      expect.objectContaining({ expectedEnvironmentPairingRevision: 10 }),
+      expect.objectContaining({ expectedEnvironmentPairingRevision: 11 })
+    ])
+  })
+
+  it('drops stale binary output and retires the old transport after a same-id re-pair', async () => {
+    replaceRuntimeEnvironmentRevisions([{ id: 'env-1', createdAt: 1, pairingRevision: 10 }])
+    const data: string[] = []
+    const onTransportClose = vi.fn()
+    const multiplexer = getRemoteRuntimeTerminalMultiplexer('env-1')
+    await multiplexer.subscribeTerminal({
+      terminal: 'terminal-1',
+      client: { id: 'desktop-1', type: 'desktop' },
+      callbacks: {
+        onData: (chunk) => data.push(chunk),
+        onSnapshot: vi.fn(),
+        onTransportClose
+      }
+    })
+
+    replaceRuntimeEnvironmentRevisions([{ id: 'env-1', createdAt: 1, pairingRevision: 11 }])
+    server.output('stale output')
+
+    expect(data).toEqual([])
+    expect(onTransportClose).toHaveBeenCalledTimes(1)
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops stale JSON events and retires the old transport after a same-id re-pair', async () => {
+    replaceRuntimeEnvironmentRevisions([{ id: 'env-1', createdAt: 1, pairingRevision: 10 }])
+    const onEnd = vi.fn()
+    const onTransportClose = vi.fn()
+    const multiplexer = getRemoteRuntimeTerminalMultiplexer('env-1')
+    const stream = await multiplexer.subscribeTerminal({
+      terminal: 'terminal-1',
+      client: { id: 'desktop-1', type: 'desktop' },
+      callbacks: { onData: vi.fn(), onSnapshot: vi.fn(), onEnd, onTransportClose }
+    })
+
+    replaceRuntimeEnvironmentRevisions([{ id: 'env-1', createdAt: 1, pairingRevision: 11 }])
+    subscriptionCallbacks.onResponse({
+      ok: true,
+      result: { type: 'end', streamId: stream.streamId }
+    })
+
+    expect(onEnd).not.toHaveBeenCalled()
+    expect(onTransportClose).toHaveBeenCalledTimes(1)
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('delivers an empty transformed span with its raw sequence metadata', async () => {
+    const { data, metas, snapshots } = await subscribeClient()
+
+    server.outputSpan('', 9)
+
+    expect(data).toEqual([''])
+    expect(metas).toEqual([{ seq: 9, rawLength: 9, transformed: true }])
+    expect(snapshots).toEqual(['INITIAL'])
+  })
+
+  it('requests an authoritative resync instead of rendering malformed span JSON', async () => {
+    const { data, snapshots } = await subscribeClient()
+
+    server.malformedOutputSpan()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(data).toEqual([])
+    expect(snapshots).toEqual(['INITIAL', '\x1b[2J\x1b[3J\x1b[HRECOVERED'])
   })
 
   it('uses UTF-16 sequence units when detecting gaps in multibyte output', async () => {
